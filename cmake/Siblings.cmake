@@ -49,9 +49,9 @@ function(docboss_check_pin dir expected name)
 endfunction()
 
 set(MDBOSS_DIR "C:/source/MDBoss" CACHE PATH "Path to the MDBoss repo")
-set(MDBOSS_EXPECTED_COMMIT "4e41ac7e5f5ec58b22c884a651606d5f8f456488")
+set(MDBOSS_EXPECTED_COMMIT "f4a3dd4aa2cffeba730b515e996d948bc2cd13e4")
 set(PDFBOSS_DIR "C:/source/PDFBoss" CACHE PATH "Path to the PDFBoss repo")
-set(PDFBOSS_EXPECTED_COMMIT "87782f6a85db221bcefad68d7a0eb3354d8aa72e")
+set(PDFBOSS_EXPECTED_COMMIT "d1f3658ac726aeb3e4becca2c870df255d9a7363")
 
 foreach(_probe "${MDBOSS_DIR}/MDBossCpp/app/AppIdentity.h"
                "${PDFBOSS_DIR}/PDFBossCpp/app/PdfDocument.h")
