@@ -1676,14 +1676,19 @@ void MainFrame::render_preview()
             ? std::string("DocBoss")
             : path_to_utf8(path_from_utf8(current_path_).filename());
 
+    // A published PDF never carries the YAML front matter, whatever the
+    // preview's Hide YAML toggle says (user ruling, 26 Sep 2026): the block is
+    // metadata for the editor and the tech-note index, not content for the
+    // reader.  While a publish is rendering, the page is built without it.
+    const bool hide_yaml = config_.hide_front_matter() || publish_render_;
+
     preview_->show_page(mdrender::render_document(
-        markdown, base, title, config_.hide_front_matter(),
+        markdown, base, title, hide_yaml,
         mdrender::theme_from_name(config_.preview_theme())));
 
     // Same source, same strip_yaml, so the slugs here are the ids in the page
     // that was just rendered.
-    outline_->set_headings(
-        mdrender::extract_outline(markdown, config_.hide_front_matter()));
+    outline_->set_headings(mdrender::extract_outline(markdown, hide_yaml));
 }
 
 void MainFrame::on_toggle_favorite(wxCommandEvent&)
@@ -2033,6 +2038,7 @@ void MainFrame::publish_document(const std::string& md_path)
     // on screen would publish a stale page whenever the render timer had not
     // fired yet, or the document had only just been opened.
     pending_publish_ = current_path_;
+    publish_render_ = true;
     render_timer_.Stop();
     SetStatusText(L"Publishing…");
     // Fallback: if the load signal never comes, print what is there after a
@@ -2061,11 +2067,15 @@ void MainFrame::on_publish_timer(wxTimerEvent&)
     }
     // The user may have moved on, or typed, while the page loaded.
     if (showing_pdf_ || dirty_ || norm_path(source) != norm_path(current_path_)) {
+        end_publish_render();
         SetStatusText(L"Publish cancelled — the document changed.");
         return;
     }
     const std::string target = published_pdf_path(source);
     preview_->export_pdf(target, [this, target](std::string failed) {
+        // Printed (or failed); either way the preview goes back to the
+        // user's own Hide YAML setting.
+        end_publish_render();
         if (!failed.empty()) {
             SetStatusText(wxEmptyString);
             wxMessageBox(wxString::FromUTF8(failed) + "\n\n" +
@@ -2079,6 +2089,20 @@ void MainFrame::on_publish_timer(wxTimerEvent&)
         // turns up in the scan.
         files_->refresh();
     });
+}
+
+void MainFrame::end_publish_render()
+{
+    if (!publish_render_) {
+        return;
+    }
+    publish_render_ = false;
+    // Only a preview that was showing the YAML needs redrawing; for everyone
+    // with Hide YAML on, the page just printed is already the right one.
+    if (!config_.hide_front_matter() && !showing_pdf_) {
+        render_preview();
+    }
+    assert(!publish_render_ && "the publish render is over");
 }
 
 void MainFrame::on_open_published(wxCommandEvent&)

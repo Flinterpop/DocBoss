@@ -1,6 +1,6 @@
 # DocBoss
 
-*Last updated: 25 Sep 2026*
+*Last updated: 26 Sep 2026*
 
 DocBoss keeps your **Markdown sources and the PDFs published from them in one folder tree**. Write and preview a document on the left, press **Publish** and its PDF appears right beside it, and the tree tells you at a glance which documents have been published, which PDFs are out of date, and which PDFs came from somewhere else. Everything is **100% offline**.
 
@@ -28,6 +28,7 @@ Click a document to edit it; click a PDF to read it. **Only one file is open at 
 **File ▸ Publish PDF** (**Ctrl+Shift+P**, or the printer button on the toolbar) writes the open document's PDF beside it, **replacing the previous one without asking**. There is no dialog: the name and place are always the same, which is the point.
 
 - **Save first.** Publish is refused while the document has unsaved edits — a published PDF has to say what the file on disk says, or it would be marked up to date while handing out text that exists nowhere.
+- **No YAML front matter.** A `--- … ---` block at the top of the document is always left out of the PDF, whether or not **Hide YAML** is on in the preview — it is metadata for you and the tech-note index, not for the reader.
 - **What you see is what you get.** The PDF is the preview, printed: the same styling, code colours, mermaid diagrams, KaTeX and tables, laid out at the page width the preview already uses. DocBoss renders the page afresh and waits for it to finish drawing before printing, so a diagram is never caught half-drawn.
 - **Right-click any document in the tree ▸ Publish PDF** publishes that one — it is opened first if it is not already the open document.
 - **Open published PDF** (**Ctrl+Shift+O**, or right-click ▸ **Open published PDF**) shows the document's PDF in the viewer, to check it before sending it anywhere.

@@ -165,6 +165,8 @@ private:
     // The two halves of a publish that waits for its page to load.
     void on_page_loaded();
     void on_publish_timer(wxTimerEvent& event);
+    // Back to the user's own Hide YAML setting after a publish.
+    void end_publish_render();
     // Switch the preview stylesheet (View menu). Persists and re-renders.
     void on_preview_theme(wxCommandEvent& event);
     // A document moved on disk (dragged in the tree, or renamed): rewrite the
@@ -271,6 +273,10 @@ private:
     wxTimer publish_timer_;
     // The document a publish is waiting to print, or empty.
     std::string pending_publish_;
+    // Set from the start of a publish until its PDF is written (or the
+    // publish is cancelled): the preview renders without YAML front matter
+    // for the whole of that, so the print cannot catch it.
+    bool publish_render_ = false;
     DocumentWatcher watcher_;
 
     std::string current_path_;
