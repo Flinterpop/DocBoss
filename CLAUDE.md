@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-*Last updated: 25 Sep 2026*
+*Last updated: 26 Sep 2026*
 
 Guidance for Claude Code working in this repository.
 
@@ -8,7 +8,7 @@ Guidance for Claude Code working in this repository.
 
 **DocBoss** — Markdown sources and the PDFs published from them, in one folder tree. Created 25 Sep 2026 because the author kept sources and exported PDFs in two parallel trees and wanted one. It is a **new app, not a merge**: MD Boss (Markdown only, MIT) and PDFBoss (PDF only, AGPL) keep shipping on their own for people who need just one of them.
 
-The repo is **public** (`github.com/Flinterpop/DocBoss`, branch `main`) — not yet created on GitHub as of 25 Sep 2026; `release.ps1` refuses until an `origin` exists. Licence **AGPL-3.0-or-later**, forced by the statically linked MuPDF.
+The repo is **public** (`github.com/Flinterpop/DocBoss`, branch `main`) — created and first released (v1.0.0, installer + portable zip) on 26 Sep 2026. Licence **AGPL-3.0-or-later**, forced by the statically linked MuPDF.
 
 ## The one rule the app is built on
 
@@ -74,7 +74,7 @@ ctest --test-dir build -C Release          # with TMP/TEMP pointed at build\clau
 - The tests write throwaway files under `fs::temp_directory_path()` — `%TEMP%`, which is inside AppData here. Always run `ctest` with `TMP` and `TEMP` set to `build\claude-scratch\tmp`.
 - **Running the app:** always `DocBoss.exe --profile build\claude-scratch\profile` with `APPDATA`, `TEMP` and `TMP` also pointed into `build\claude-scratch`. `--profile` moves the settings and the preview's staging (and WebView2 profile) under that folder; nothing then touches AppData. Point the profile's roots at a scratch folder of neutral documents — never screenshot against the real profile.
 - The preview's **network lock** must hold: a document with a remote `<img>`/`<script>` aimed at a loopback listener must produce no connection, with a positive control proving the listener counts. Re-run it when anything around `PreviewPane` changes (MD Boss's CLAUDE.md has the full procedure).
-- Verified 25 Sep 2026: Release and asserts builds clean at `/W4 /WX`; 25 tests pass; `dumpbin /dependents` shows no VCRUNTIME/MSVCP; one window on a simultaneous double launch; publish → green, edit → orange, republish → green; published PDF matches the preview including mermaid; loopback lock check 0 connections (control 1); installer compiles. **Not yet verified:** the updater against a real release (there is none yet), and an install/uninstall run of the installer.
+- Verified 25 Sep 2026: Release and asserts builds clean at `/W4 /WX`; 25 tests pass; `dumpbin /dependents` shows no VCRUNTIME/MSVCP; one window on a simultaneous double launch; publish → green, edit → orange, republish → green; published PDF matches the preview including mermaid; loopback lock check 0 connections (control 1); installer compiles. **Not yet verified:** the updater from one real release to the next (v1.0.0 is the only one), and an install/uninstall run of the installer.
 
 ## Releasing
 
