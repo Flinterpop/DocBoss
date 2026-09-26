@@ -162,7 +162,10 @@ private:
     bool leave_pdf(OpenMode mode);
     // What the window is showing: the open document, or the open PDF.
     std::string shown_path() const;
-    // The two halves of a publish that waits for its page to load.
+    // Publish and Export share one print: re-render without YAML front
+    // matter, wait for the page to load, then print to `target`.
+    void start_print(const std::string& target, bool publish);
+    // The two halves of a print that waits for its page to load.
     void on_page_loaded();
     void on_publish_timer(wxTimerEvent& event);
     // Back to the user's own Hide YAML setting after a publish.
@@ -271,11 +274,14 @@ private:
     wxTimer render_timer_;
     wxTimer scroll_echo_timer_;
     wxTimer publish_timer_;
-    // The document a publish is waiting to print, or empty.
-    std::string pending_publish_;
-    // Set from the start of a publish until its PDF is written (or the
-    // publish is cancelled): the preview renders without YAML front matter
-    // for the whole of that, so the print cannot catch it.
+    // The PDF a Publish or Export is waiting to print, or empty; the document
+    // it was started on (empty for an untitled buffer); and which command.
+    std::string pending_target_;
+    std::string pending_source_;
+    bool pending_is_publish_ = false;
+    // Set from the start of a Publish or Export until its PDF is written (or
+    // it is cancelled): the preview renders without YAML front matter for
+    // the whole of that, so the print cannot catch it.
     bool publish_render_ = false;
     DocumentWatcher watcher_;
 

@@ -28,7 +28,7 @@ Click a document to edit it; click a PDF to read it. **Only one file is open at 
 **File ▸ Publish PDF** (**Ctrl+Shift+P**, or the printer button on the toolbar) writes the open document's PDF beside it, **replacing the previous one without asking**. There is no dialog: the name and place are always the same, which is the point.
 
 - **Save first.** Publish is refused while the document has unsaved edits — a published PDF has to say what the file on disk says, or it would be marked up to date while handing out text that exists nowhere.
-- **No YAML front matter.** A `--- … ---` block at the top of the document is always left out of the PDF, whether or not **Hide YAML** is on in the preview — it is metadata for you and the tech-note index, not for the reader.
+- **No YAML front matter.** A `--- … ---` block at the top of the document is always left out of the PDF, whether or not **Hide YAML** is on in the preview — it is metadata for you and the tech-note index, not for the reader. **Export as PDF…** leaves it out too.
 - **What you see is what you get.** The PDF is the preview, printed: the same styling, code colours, mermaid diagrams, KaTeX and tables, laid out at the page width the preview already uses. DocBoss renders the page afresh and waits for it to finish drawing before printing, so a diagram is never caught half-drawn.
 - **Right-click any document in the tree ▸ Publish PDF** publishes that one — it is opened first if it is not already the open document.
 - **Open published PDF** (**Ctrl+Shift+O**, or right-click ▸ **Open published PDF**) shows the document's PDF in the viewer, to check it before sending it anywhere.
@@ -147,7 +147,7 @@ Only the styling changes — the document is untouched, and switching re-renders
 
 For the everyday case use **Publish** instead — see **Publishing PDFs** above. Everything below about how the PDF looks applies to both.
 
-**File ▸ Export as PDF…** writes the document exactly as the preview shows it — the GitHub styling, the code-block shading and syntax colours, mermaid diagrams, KaTeX maths, tables and task-list boxes. The filename is suggested from the document's own name, in its own folder.
+**File ▸ Export as PDF…** writes the document as the preview shows it, less any YAML front matter — the GitHub styling, the code-block shading and syntax colours, mermaid diagrams, KaTeX maths, tables and task-list boxes. The filename is suggested from the document's own name, in its own folder.
 
 **The preview is laid out at the PDF's page width** — a Letter page less its 0.4 in margins, 7.7 in — in both styles, however wide the pane is. So what you see is what prints: a line that breaks in the preview breaks in the same place in the PDF, and a table's columns come out the same width. A wider pane only adds space either side of the page.
 

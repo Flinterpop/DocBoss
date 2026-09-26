@@ -1676,10 +1676,11 @@ void MainFrame::render_preview()
             ? std::string("DocBoss")
             : path_to_utf8(path_from_utf8(current_path_).filename());
 
-    // A published PDF never carries the YAML front matter, whatever the
-    // preview's Hide YAML toggle says (user ruling, 26 Sep 2026): the block is
-    // metadata for the editor and the tech-note index, not content for the
-    // reader.  While a publish is rendering, the page is built without it.
+    // A PDF -- published or exported -- never carries the YAML front matter,
+    // whatever the preview's Hide YAML toggle says (user rulings, 26 Sep
+    // 2026): the block is metadata for the editor and the tech-note index,
+    // not content for the reader.  While a print is rendering, the page is
+    // built without it.
     const bool hide_yaml = config_.hide_front_matter() || publish_render_;
 
     preview_->show_page(mdrender::render_document(
@@ -1968,21 +1969,15 @@ void MainFrame::on_export_pdf(wxCommandEvent&)
     if (dialog.ShowModal() != wxID_OK) {
         return;
     }
-    const std::string target = std::string(dialog.GetPath().ToUTF8());
-
-    SetStatusText(L"Exporting PDF…");
-    // The export is asynchronous, so the frame may be gone by the time it
-    // finishes.  A modal file dialog has just been dismissed, not a modal
-    // wait, so nothing is holding the window open.
-    preview_->export_pdf(target, [this, target](std::string failed) {
-        if (!failed.empty()) {
-            SetStatusText(wxEmptyString);
-            wxMessageBox(wxString::FromUTF8(failed), "DocBoss",
-                         wxOK | wxICON_ERROR, this);
-            return;
-        }
-        SetStatusText(wxString::FromUTF8("Exported " + target));
-    });
+    if (!pending_target_.empty()) {
+        SetStatusText(L"Already printing a PDF — one moment.");
+        return;
+    }
+    // Through the same render-then-print path as Publish, so an export also
+    // leaves out the YAML front matter (user ruling, 26 Sep 2026).  Unlike
+    // Publish it may print unsaved text: an export is a one-off copy, not a
+    // publication the tree will vouch for.
+    start_print(std::string(dialog.GetPath().ToUTF8()), false);
 }
 
 // ---------------------------------------------------------- publishing --
@@ -2008,8 +2003,8 @@ void MainFrame::publish_document(const std::string& md_path)
     assert(!md_path.empty() && "publish needs a document");
     assert(is_markdown(path_to_utf8(path_from_utf8(md_path).filename())) &&
            "only a Markdown document is published");
-    if (!pending_publish_.empty()) {
-        SetStatusText(L"Already publishing — one moment.");
+    if (!pending_target_.empty()) {
+        SetStatusText(L"Already printing a PDF — one moment.");
         return;
     }
     // Publishing renders through the preview, so the document has to be the
@@ -2034,23 +2029,33 @@ void MainFrame::publish_document(const std::string& md_path)
         return;
     }
 
+    start_print(published_pdf_path(current_path_), true);
+}
+
+void MainFrame::start_print(const std::string& target, bool publish)
+{
+    assert(!target.empty() && "a print needs somewhere to go");
+    assert(pending_target_.empty() && "one print at a time");
     // Render afresh and print once THAT page has loaded.  Printing whatever is
-    // on screen would publish a stale page whenever the render timer had not
-    // fired yet, or the document had only just been opened.
-    pending_publish_ = current_path_;
+    // on screen would catch a stale page whenever the render timer had not
+    // fired yet or the document had only just been opened -- and it is the
+    // re-render that leaves out the YAML front matter (publish_render_).
+    pending_target_ = target;
+    pending_source_ = current_path_;
+    pending_is_publish_ = publish;
     publish_render_ = true;
     render_timer_.Stop();
-    SetStatusText(L"Publishing…");
+    SetStatusText(publish ? L"Publishing…" : L"Exporting PDF…");
     // Fallback: if the load signal never comes, print what is there after a
-    // generous wait rather than leaving Publish stuck for the session.  The
-    // load handler restarts this with the short settle delay.
+    // generous wait rather than leaving the command stuck for the session.
+    // The load handler restarts this with the short settle delay.
     publish_timer_.Start(kPublishFallbackMs, wxTIMER_ONE_SHOT);
     render_preview();
 }
 
 void MainFrame::on_page_loaded()
 {
-    if (pending_publish_.empty()) {
+    if (pending_target_.empty()) {
         return;
     }
     // The page's scripts -- mermaid above all -- run on DOMContentLoaded and
@@ -2060,19 +2065,26 @@ void MainFrame::on_page_loaded()
 
 void MainFrame::on_publish_timer(wxTimerEvent&)
 {
-    const std::string source = pending_publish_;
-    pending_publish_.clear();
-    if (source.empty()) {
+    const std::string target = pending_target_;
+    const std::string source = pending_source_;
+    const bool publish = pending_is_publish_;
+    pending_target_.clear();
+    pending_source_.clear();
+    if (target.empty()) {
         return;
     }
-    // The user may have moved on, or typed, while the page loaded.
-    if (showing_pdf_ || dirty_ || norm_path(source) != norm_path(current_path_)) {
+    // The user may have moved on while the page loaded -- or, for a publish,
+    // typed: a publication must match the file on disk; an export need not.
+    if (showing_pdf_ || norm_path(source) != norm_path(current_path_) ||
+        (publish && dirty_)) {
         end_publish_render();
-        SetStatusText(L"Publish cancelled — the document changed.");
+        SetStatusText(publish ? L"Publish cancelled — the document changed."
+                              : L"Export cancelled — the document changed.");
         return;
     }
-    const std::string target = published_pdf_path(source);
-    preview_->export_pdf(target, [this, target](std::string failed) {
+    // The export is asynchronous, so the frame may be gone by the time it
+    // finishes; nothing modal is holding the window open.
+    preview_->export_pdf(target, [this, target, publish](std::string failed) {
         // Printed (or failed); either way the preview goes back to the
         // user's own Hide YAML setting.
         end_publish_render();
@@ -2081,6 +2093,10 @@ void MainFrame::on_publish_timer(wxTimerEvent&)
             wxMessageBox(wxString::FromUTF8(failed) + "\n\n" +
                              wxString::FromUTF8(target),
                          "DocBoss", wxOK | wxICON_ERROR, this);
+            return;
+        }
+        if (!publish) {
+            SetStatusText(wxString::FromUTF8("Exported " + target));
             return;
         }
         SetStatusText(wxString::FromUTF8(
