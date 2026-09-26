@@ -10,7 +10,7 @@
 ; cmake/Siblings.cmake.
 
 #define AppName "DocBoss"
-#define AppVersion "1.0.3"
+#define AppVersion "1.1.0"
 #define AppExe "DocBoss.exe"
 #define BuildDir "build\app\Release"
 #ifndef MDBossDir

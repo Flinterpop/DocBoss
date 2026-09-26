@@ -30,7 +30,7 @@ cmake_minimum_required(VERSION 3.21)
 
 # Kept in step with app/Version.h, app/DocBoss.rc and installer.iss by
 # release.ps1; tests/test_version.cpp enforces it.
-project(DocBoss VERSION 1.0.3 LANGUAGES CXX)
+project(DocBoss VERSION 1.1.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
