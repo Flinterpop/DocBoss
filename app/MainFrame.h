@@ -25,7 +25,9 @@
 #include <wx/stc/stc.h>
 #include <wx/timer.h>
 
+#include <deque>
 #include <string>
+#include <vector>
 
 #include "PdfSettings.h"
 #include "PdfView.h"
@@ -170,6 +172,12 @@ private:
     void on_publish_timer(wxTimerEvent& event);
     // Back to the user's own Hide YAML setting after a publish.
     void end_publish_render();
+    // Publish all stale: every document whose PDF is out of date, at or
+    // below `folder` (everything, when empty), one at a time through the
+    // ordinary Publish path, then back to what was open.
+    void publish_stale(const std::string& folder);
+    void publish_next_in_batch();
+    void finish_batch();
     // Switch the preview stylesheet (View menu). Persists and re-renders.
     void on_preview_theme(wxCommandEvent& event);
     // A document moved on disk (dragged in the tree, or renamed): rewrite the
@@ -283,6 +291,14 @@ private:
     // it is cancelled): the preview renders without YAML front matter for
     // the whole of that, so the print cannot catch it.
     bool publish_render_ = false;
+    // Publish all stale, while it runs.
+    bool batch_active_ = false;
+    std::deque<std::string> batch_queue_;
+    std::size_t batch_total_ = 0;
+    std::size_t batch_done_ = 0;
+    std::vector<std::string> batch_errors_;
+    // What was showing when the batch started, to go back to.
+    std::string batch_return_;
     DocumentWatcher watcher_;
 
     std::string current_path_;

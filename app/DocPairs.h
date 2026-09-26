@@ -28,6 +28,7 @@ enum class PdfState {
 };
 
 struct PdfLink {
+    std::string md_path;    // the document, UTF-8, absolute, as scanned
     std::string pdf_path;   // UTF-8, absolute
     PdfState state = PdfState::kNone;
 };
@@ -49,6 +50,12 @@ Pairing classify_pairs(const std::vector<mdboss::DocEntry>& documents,
 // The state a document's publication is in, from a pairing.  kNone when the
 // document is not in it.
 PdfState pdf_state(const Pairing& pairing, const std::string& md_path);
+
+// Every document whose publication is stale, at or below `folder` (every
+// one, when `folder` is empty), sorted case-insensitively by path with each
+// folder's contents kept together.  What Publish all stale works through.
+std::vector<std::string> stale_documents(const Pairing& pairing,
+                                         const std::string& folder);
 
 }  // namespace docboss
 

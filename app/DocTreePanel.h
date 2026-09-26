@@ -132,6 +132,19 @@ public:
         on_publish_ = std::move(handler);
     }
 
+    // "Publish stale PDFs here" on a folder's row; the folder is passed.
+    void set_on_publish_stale(std::function<void(const std::string&)> handler)
+    {
+        on_publish_stale_ = std::move(handler);
+    }
+
+    // Documents whose PDF is stale at or below `folder` (all of them when it
+    // is empty), as of the last scan.  See docboss::stale_documents.
+    std::vector<std::string> stale_documents(const std::string& folder) const
+    {
+        return docboss::stale_documents(pairing_, folder);
+    }
+
     // The PDF published from `md_path` as of the last scan, or empty.
     std::string published_pdf(const std::string& md_path) const;
     // Whether `md_path` is published, and whether that PDF is current.
@@ -327,6 +340,7 @@ private:
     std::string drag_source_;
     std::function<void()> on_import_to_inbox_;
     std::function<void(const std::string&)> on_publish_;
+    std::function<void(const std::string&)> on_publish_stale_;
     std::function<void()> on_manage_templates_;
     std::function<void()> on_manage_folders_;
 };

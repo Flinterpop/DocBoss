@@ -110,6 +110,36 @@ TEST_CASE("a stem with dots pairs on the whole stem", "[pairs]")
           docboss::PdfState::kNone);
 }
 
+TEST_CASE("stale documents are listed, in path order, by folder", "[pairs]")
+{
+    const auto pairing = docboss::classify_pairs(
+        {entry("C:\\Docs\\b.md", 9), entry("C:\\Docs\\a.md", 9),
+         entry("C:\\Docs\\current.md", 1), entry("C:\\Docs\\Sub\\c.md", 9),
+         entry("C:\\Docs2\\d.md", 9), entry("C:\\Docs\\never.md", 9)},
+        {entry("C:\\Docs\\b.pdf", 5), entry("C:\\Docs\\a.pdf", 5),
+         entry("C:\\Docs\\current.pdf", 5), entry("C:\\Docs\\Sub\\c.pdf", 5),
+         entry("C:\\Docs2\\d.pdf", 5)});
+
+    // Everything stale, never-published and current ones left out.  The
+    // paths come back as scanned, not lower-cased.
+    const std::vector<std::string> all = docboss::stale_documents(pairing, "");
+    REQUIRE(all.size() == 4);
+    CHECK(all[0] == "C:\\Docs\\a.md");
+    CHECK(all[1] == "C:\\Docs\\b.md");
+    CHECK(all[2] == "C:\\Docs\\Sub\\c.md");
+    CHECK(all[3] == "C:\\Docs2\\d.md");
+
+    // A folder takes its subfolders but not a sibling that shares its name
+    // as a prefix.
+    const std::vector<std::string> docs =
+        docboss::stale_documents(pairing, "c:\\docs");
+    CHECK(docs.size() == 3);
+    const std::vector<std::string> sub =
+        docboss::stale_documents(pairing, "C:\\Docs\\Sub\\");
+    REQUIRE(sub.size() == 1);
+    CHECK(sub[0] == "C:\\Docs\\Sub\\c.md");
+}
+
 TEST_CASE("a .markdown source pairs like a .md one", "[pairs]")
 {
     const auto pairing = docboss::classify_pairs(

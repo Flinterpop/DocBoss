@@ -87,6 +87,7 @@ constexpr int kSearchTimerId = wxID_HIGHEST + 74;
 constexpr int kSelectTimerId = wxID_HIGHEST + 75;
 constexpr int kIdPublish = wxID_HIGHEST + 76;
 constexpr int kIdOpenPublished = wxID_HIGHEST + 77;
+constexpr int kIdPublishStale = wxID_HIGHEST + 78;
 
 // The one kind of file the tree shows besides Markdown.
 const std::vector<std::string> kCompanionExts = {".pdf"};
@@ -1124,6 +1125,17 @@ void DocTreePanel::build_context_menu(
     if (is_file) {
         menu.AppendSeparator();
     }
+    // A folder can republish everything stale beneath it.  Greyed, with the
+    // count in the label, so the menu says what the command would do.
+    if (!is_file && on_publish_stale_) {
+        const std::size_t stale = stale_documents(path).size();
+        wxString label = L"&Publish stale PDFs here";
+        if (stale > 0) {
+            label += wxString::Format(L" (%zu)", stale);
+        }
+        menu.Append(kIdPublishStale, label)->Enable(stale > 0);
+        menu.AppendSeparator();
+    }
     // "New file" is a submenu rather than one item so a document can be
     // started from a template *in the folder you clicked*.  Reaching the
     // templates only from the File menu means always creating in the default
@@ -1207,6 +1219,11 @@ void DocTreePanel::bind_context_menu(
             on_publish_(path);
         }
     }, kIdPublish);
+    menu.Bind(wxEVT_MENU, [this, path](wxCommandEvent&) {
+        if (on_publish_stale_) {
+            on_publish_stale_(path);
+        }
+    }, kIdPublishStale);
     menu.Bind(wxEVT_MENU, [this, path](wxCommandEvent&) {
         const std::string pdf = published_pdf(path);
         if (!pdf.empty() && on_open_) {

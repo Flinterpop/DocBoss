@@ -1,7 +1,9 @@
 #include "DocPairs.h"
 
+#include <algorithm>
 #include <cassert>
 #include <filesystem>
+#include <utility>
 
 #include "mdboss/PathUtf8.h"
 
@@ -39,6 +41,7 @@ Pairing classify_pairs(const std::vector<mdboss::DocEntry>& documents,
         }
         const mdboss::DocEntry& pdf = *found->second;
         PdfLink link;
+        link.md_path = doc.path;
         link.pdf_path = pdf.path;
         // A time that could not be read is 0; treat an unknown source time
         // as "not newer", so a failure to read never cries stale.
@@ -64,6 +67,43 @@ PdfState pdf_state(const Pairing& pairing, const std::string& md_path)
     const auto found = pairing.published.find(mdboss::norm_path(md_path));
     return found == pairing.published.end() ? PdfState::kNone
                                             : found->second.state;
+}
+
+std::vector<std::string> stale_documents(const Pairing& pairing,
+                                         const std::string& folder)
+{
+    // A trailing separator on the prefix, so "C:\Docs" does not also claim
+    // "C:\Docs2".
+    std::string prefix;
+    if (!folder.empty()) {
+        prefix = mdboss::norm_path(folder);
+        if (!prefix.empty() && prefix.back() != '\\') {
+            prefix += '\\';
+        }
+    }
+    // Sorted on the normalised path with the separator ranked below every
+    // other character, so a folder's contents stay together: plain string
+    // order would put "docs2\..." between "docs\a" and "docs\sub\...".
+    std::vector<std::pair<std::string, std::string>> keyed;
+    for (const auto& [key, link] : pairing.published) {   // bounded by the scan
+        if (link.state != PdfState::kStale) {
+            continue;
+        }
+        if (!prefix.empty() && key.compare(0, prefix.size(), prefix) != 0) {
+            continue;
+        }
+        std::string order = key;
+        std::replace(order.begin(), order.end(), '\\', '\x01');
+        keyed.emplace_back(std::move(order), link.md_path);
+    }
+    std::sort(keyed.begin(), keyed.end());
+    std::vector<std::string> out;
+    out.reserve(keyed.size());
+    for (auto& item : keyed) {   // bounded by the scan
+        out.push_back(std::move(item.second));
+    }
+    assert(out.size() <= pairing.published.size());
+    return out;
 }
 
 }  // namespace docboss

@@ -100,6 +100,7 @@ constexpr int kIdOpenPublished = wxID_HIGHEST + 34;
 constexpr int kIdBookmarkPage = wxID_HIGHEST + 35;
 
 constexpr int kIdPublishTimer = wxID_HIGHEST + 36;
+constexpr int kIdPublishStale = wxID_HIGHEST + 37;
 
 // Publish prints a freshly rendered page.  The settle delay runs from the
 // page's load, giving mermaid and KaTeX -- which draw on DOMContentLoaded --
@@ -364,6 +365,7 @@ void MainFrame::build_menu()
     // document.  Export stays for the one-off copy saved somewhere else.
     file->Append(kIdPublish, L"&Publish PDF\tCtrl+Shift+P");
     file->Append(kIdOpenPublished, L"Open pu&blished PDF\tCtrl+Shift+O");
+    file->Append(kIdPublishStale, L"Publish all s&tale PDFs…");
     file->Append(kIdExportPdf, L"&Export as PDF…");
     file->AppendSeparator();
     file->Append(kIdOpenTemplates, "Open &templates folder");
@@ -624,6 +626,8 @@ void MainFrame::build_panes()
     files_->set_on_import_to_inbox([this] { on_import_to_inbox(); });
     files_->set_on_publish(
         [this](const std::string& path) { publish_document(path); });
+    files_->set_on_publish_stale(
+        [this](const std::string& folder) { publish_stale(folder); });
     files_->set_on_path_moved([this](const std::string& from,
                                      const std::string& to) {
         on_path_moved(from, to);
@@ -874,6 +878,8 @@ void MainFrame::bind_events()
     Bind(wxEVT_MENU, &MainFrame::on_export_pdf, this, kIdExportPdf);
     Bind(wxEVT_MENU, &MainFrame::on_publish, this, kIdPublish);
     Bind(wxEVT_MENU, &MainFrame::on_open_published, this, kIdOpenPublished);
+    Bind(wxEVT_MENU, [this](wxCommandEvent&) { publish_stale(std::string()); },
+         kIdPublishStale);
     Bind(wxEVT_MENU, [this](wxCommandEvent&) {
         if (showing_pdf_) {
             pdf_view_->bookmark_current_page();
@@ -1969,7 +1975,7 @@ void MainFrame::on_export_pdf(wxCommandEvent&)
     if (dialog.ShowModal() != wxID_OK) {
         return;
     }
-    if (!pending_target_.empty()) {
+    if (!pending_target_.empty() || batch_active_) {
         SetStatusText(L"Already printing a PDF — one moment.");
         return;
     }
@@ -2003,7 +2009,7 @@ void MainFrame::publish_document(const std::string& md_path)
     assert(!md_path.empty() && "publish needs a document");
     assert(is_markdown(path_to_utf8(path_from_utf8(md_path).filename())) &&
            "only a Markdown document is published");
-    if (!pending_target_.empty()) {
+    if (!pending_target_.empty() || batch_active_) {
         SetStatusText(L"Already printing a PDF — one moment.");
         return;
     }
@@ -2078,6 +2084,15 @@ void MainFrame::on_publish_timer(wxTimerEvent&)
     if (showing_pdf_ || norm_path(source) != norm_path(current_path_) ||
         (publish && dirty_)) {
         end_publish_render();
+        if (batch_active_) {
+            // Something else took over the window mid-batch; the rest of the
+            // list would publish from under whatever the user is doing now.
+            batch_queue_.clear();
+            batch_errors_.push_back("Stopped: the window was used for "
+                                    "something else during the batch.");
+            finish_batch();
+            return;
+        }
         SetStatusText(publish ? L"Publish cancelled — the document changed."
                               : L"Export cancelled — the document changed.");
         return;
@@ -2088,6 +2103,20 @@ void MainFrame::on_publish_timer(wxTimerEvent&)
         // Printed (or failed); either way the preview goes back to the
         // user's own Hide YAML setting.
         end_publish_render();
+        if (batch_active_) {
+            // One dialog at the end, not one per file.
+            if (failed.empty()) {
+                ++batch_done_;
+            } else {
+                batch_errors_.push_back(
+                    path_to_utf8(path_from_utf8(target).filename()) + ": " +
+                    failed);
+            }
+            // After this callback has unwound, not inside it: the next step
+            // opens a document and re-renders the preview.
+            CallAfter([this] { publish_next_in_batch(); });
+            return;
+        }
         if (!failed.empty()) {
             SetStatusText(wxEmptyString);
             wxMessageBox(wxString::FromUTF8(failed) + "\n\n" +
@@ -2105,6 +2134,134 @@ void MainFrame::on_publish_timer(wxTimerEvent&)
         // turns up in the scan.
         files_->refresh();
     });
+}
+
+void MainFrame::publish_stale(const std::string& folder)
+{
+    if (!pending_target_.empty() || batch_active_) {
+        SetStatusText(L"Already printing a PDF — one moment.");
+        return;
+    }
+    // As of the last scan.  A document edited since is still caught: its
+    // save changed the file, and F5 or any save to a new path rescans.
+    const std::vector<std::string> stale = files_->stale_documents(folder);
+    if (stale.empty()) {
+        SetStatusText(L"Nothing to publish: no PDF is out of date.");
+        return;
+    }
+    if (!preview_->ready()) {
+        wxMessageBox(L"The preview is still starting up. Try again in a "
+                     L"moment.",
+                     "DocBoss", wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+    // Asked, because it overwrites every one of them.
+    const wxString where =
+        folder.empty() ? wxString(L"under your folders")
+                       : L"in " + wxString::FromUTF8(path_to_utf8(
+                                      path_from_utf8(folder).filename()));
+    const int answer = wxMessageBox(
+        wxString::Format(L"Republish %zu out-of-date PDF(s) ", stale.size()) +
+            where + L"?\n\nEach document is opened in turn and its PDF "
+                    L"replaced.  Whatever you have open now comes back "
+                    L"afterwards.",
+        "DocBoss", wxYES_NO | wxICON_QUESTION, this);
+    if (answer != wxYES) {
+        return;
+    }
+    // Taken before anything is cleared: a document whose edits are discarded
+    // below still comes back afterwards, as it is on disk.
+    const std::string return_to = shown_path();
+    // The documents are opened one after another, so unsaved work in what is
+    // open now has to be dealt with first -- once, not per document.
+    if (!confirm_discard()) {
+        return;
+    }
+    // "Don't save" leaves the buffer dirty, and a dirty buffer makes every
+    // browse-mode open below refuse -- the user has already said to drop it.
+    if (dirty_) {
+        clear_document();
+    }
+
+    batch_queue_.assign(stale.begin(), stale.end());
+    batch_total_ = stale.size();
+    batch_done_ = 0;
+    batch_errors_.clear();
+    batch_return_ = return_to;
+    batch_active_ = true;
+    publish_next_in_batch();
+}
+
+void MainFrame::publish_next_in_batch()
+{
+    if (!batch_active_) {
+        return;
+    }
+    // Bounded: every pass takes one entry off the queue, and a document that
+    // cannot be opened is recorded and skipped without printing.
+    while (!batch_queue_.empty()) {
+        const std::string path = batch_queue_.front();
+        batch_queue_.pop_front();
+        const std::size_t index = batch_total_ - batch_queue_.size();
+        SetStatusText(wxString::Format(L"Publishing %zu of %zu: ", index,
+                                       batch_total_) +
+                      wxString::FromUTF8(
+                          path_to_utf8(path_from_utf8(path).filename())));
+        // Browse mode: no dialog, no Recent entry, no config write.  And no
+        // history entry either -- a batch is not the user reading anything.
+        navigating_ = true;
+        const bool opened = open_path(path, OpenMode::kBrowse);
+        navigating_ = false;
+        if (!opened || dirty_) {
+            // Gone since the scan, or not UTF-8 (browsing will not convert).
+            batch_errors_.push_back(
+                path_to_utf8(path_from_utf8(path).filename()) +
+                ": could not be opened for publishing");
+            continue;
+        }
+        start_print(published_pdf_path(current_path_), true);
+        return;   // on_publish_timer's callback brings us back here
+    }
+    finish_batch();
+}
+
+void MainFrame::finish_batch()
+{
+    assert(batch_active_ && "only a running batch finishes");
+    batch_active_ = false;
+    batch_queue_.clear();
+    const std::size_t done = batch_done_;
+    const std::vector<std::string> errors = batch_errors_;
+    batch_errors_.clear();
+
+    // Back to what was open before, quietly.
+    if (!batch_return_.empty()) {
+        navigating_ = true;
+        open_path(batch_return_, OpenMode::kBrowse);
+        navigating_ = false;
+    } else {
+        clear_document();
+    }
+    batch_return_.clear();
+    // Once, at the end: every publication just written changes a marker.
+    files_->refresh();
+
+    SetStatusText(wxString::Format(L"Published %zu of %zu PDF(s).", done,
+                                   batch_total_));
+    if (!errors.empty()) {
+        std::string text;
+        for (std::size_t i = 0; i < errors.size() && i < 20; ++i) {   // bounded
+            text += errors[i] + "\n";
+        }
+        if (errors.size() > 20) {
+            text += "...and " + std::to_string(errors.size() - 20) + " more\n";
+        }
+        wxMessageBox(wxString::Format(L"Published %zu of %zu PDF(s).  These "
+                                      L"were not:\n\n",
+                                      done, batch_total_) +
+                         wxString::FromUTF8(text),
+                     "DocBoss", wxOK | wxICON_WARNING, this);
+    }
 }
 
 void MainFrame::end_publish_render()
