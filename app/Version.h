@@ -9,7 +9,7 @@
 namespace docboss {
 
 inline constexpr const char* kAppName = "DocBoss";
-inline constexpr const char* kAppVersion = "1.0.0";
+inline constexpr const char* kAppVersion = "1.0.1";
 inline constexpr const char* kAttribution = "Bungee Studios 2026  B.Graham";
 
 }  // namespace docboss
