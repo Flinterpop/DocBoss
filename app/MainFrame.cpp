@@ -29,6 +29,7 @@
 #include "mdboss/FindBar.h"
 #include "mdboss/FindInFilesDialog.h"
 #include "mdboss/FoldersDialog.h"
+#include "PdfInfo.h"
 #include "Publish.h"
 #include "Version.h"
 #include "HelpDialog.h"
@@ -101,6 +102,8 @@ constexpr int kIdBookmarkPage = wxID_HIGHEST + 35;
 
 constexpr int kIdPublishTimer = wxID_HIGHEST + 36;
 constexpr int kIdPublishStale = wxID_HIGHEST + 37;
+constexpr int kIdStopBatch = wxID_HIGHEST + 38;
+constexpr int kIdPageHeaders = wxID_HIGHEST + 39;
 
 // Publish prints a freshly rendered page.  The settle delay runs from the
 // page's load, giving mermaid and KaTeX -- which draw on DOMContentLoaded --
@@ -366,7 +369,12 @@ void MainFrame::build_menu()
     file->Append(kIdPublish, L"&Publish PDF\tCtrl+Shift+P");
     file->Append(kIdOpenPublished, L"Open pu&blished PDF\tCtrl+Shift+O");
     file->Append(kIdPublishStale, L"Publish all s&tale PDFs…");
+    file->Append(kIdStopBatch, L"Sto&p publishing");
+    file->Enable(kIdStopBatch, false);   // only while a batch runs
     file->Append(kIdExportPdf, L"&Export as PDF…");
+    file->AppendCheckItem(kIdPageHeaders,
+                          L"PDF page &headers and footers");
+    file->Check(kIdPageHeaders, pdf_settings_.page_headers());
     file->AppendSeparator();
     file->Append(kIdOpenTemplates, "Open &templates folder");
     file->Append(kIdManageFolders, L"&Manage folders…");
@@ -880,6 +888,18 @@ void MainFrame::bind_events()
     Bind(wxEVT_MENU, &MainFrame::on_open_published, this, kIdOpenPublished);
     Bind(wxEVT_MENU, [this](wxCommandEvent&) { publish_stale(std::string()); },
          kIdPublishStale);
+    Bind(wxEVT_MENU, [this](wxCommandEvent&) {
+        // The PDF being printed now finishes; nothing after it starts.
+        if (batch_active_ && !batch_queue_.empty()) {
+            batch_stopped_ = batch_queue_.size();
+            batch_queue_.clear();
+            SetStatusText(L"Stopping after the current PDF…");
+        }
+    }, kIdStopBatch);
+    Bind(wxEVT_MENU, [this](wxCommandEvent& event) {
+        pdf_settings_.set_page_headers(event.IsChecked());
+        pdf_settings_.save();
+    }, kIdPageHeaders);
     Bind(wxEVT_MENU, [this](wxCommandEvent&) {
         if (showing_pdf_) {
             pdf_view_->bookmark_current_page();
@@ -1689,9 +1709,16 @@ void MainFrame::render_preview()
     // built without it.
     const bool hide_yaml = config_.hide_front_matter() || publish_render_;
 
-    preview_->show_page(mdrender::render_document(
+    std::string page = mdrender::render_document(
         markdown, base, title, hide_yaml,
-        mdrender::theme_from_name(config_.preview_theme())));
+        mdrender::theme_from_name(config_.preview_theme()));
+    // A printed page carries its title, version, date and page numbers in the
+    // margins.  Print-only CSS, so the preview on screen is unchanged even
+    // while a print is rendering.
+    if (publish_render_ && pdf_settings_.page_headers()) {
+        page = add_page_margin_boxes(page, pending_meta_, today_stamp());
+    }
+    preview_->show_page(page);
 
     // Same source, same strip_yaml, so the slugs here are the ids in the page
     // that was just rendered.
@@ -2049,6 +2076,13 @@ void MainFrame::start_print(const std::string& target, bool publish)
     pending_target_ = target;
     pending_source_ = current_path_;
     pending_is_publish_ = publish;
+    // Read once, from the text being printed: it feeds both the page margins
+    // and, afterwards, the PDF's document properties.
+    pending_meta_ = read_doc_meta(
+        editor_->GetText().utf8_string(),
+        current_path_.empty()
+            ? std::string("Untitled")
+            : path_to_utf8(path_from_utf8(current_path_).stem()));
     publish_render_ = true;
     render_timer_.Stop();
     SetStatusText(publish ? L"Publishing…" : L"Exporting PDF…");
@@ -2099,14 +2133,35 @@ void MainFrame::on_publish_timer(wxTimerEvent&)
     }
     // The export is asynchronous, so the frame may be gone by the time it
     // finishes; nothing modal is holding the window open.
-    preview_->export_pdf(target, [this, target, publish](std::string failed) {
+    const DocMeta meta = pending_meta_;
+    preview_->export_pdf(target, [this, target, publish,
+                                  meta](std::string failed) {
         // Printed (or failed); either way the preview goes back to the
         // user's own Hide YAML setting.
         end_publish_render();
+        // Chromium writes only the page's <title> and its own name into the
+        // PDF's properties.  Title, Author, Subject and Keywords come from
+        // the front matter.  A failure here costs the properties, never the
+        // PDF, so it is reported beside the result rather than instead of it.
+        std::string info_error;
+        if (failed.empty()) {
+            info_error = write_pdf_info(target, meta);
+        }
+        const wxString info_note =
+            info_error.empty()
+                ? wxString()
+                : L"  (document properties not set: " +
+                      wxString::FromUTF8(info_error) + L")";
         if (batch_active_) {
             // One dialog at the end, not one per file.
             if (failed.empty()) {
                 ++batch_done_;
+                if (!info_error.empty()) {
+                    batch_errors_.push_back(
+                        path_to_utf8(path_from_utf8(target).filename()) +
+                        ": published, but its document properties were not "
+                        "set: " + info_error);
+                }
             } else {
                 batch_errors_.push_back(
                     path_to_utf8(path_from_utf8(target).filename()) + ": " +
@@ -2125,11 +2180,14 @@ void MainFrame::on_publish_timer(wxTimerEvent&)
             return;
         }
         if (!publish) {
-            SetStatusText(wxString::FromUTF8("Exported " + target));
+            SetStatusText(wxString::FromUTF8("Exported " + target) +
+                          info_note);
             return;
         }
-        SetStatusText(wxString::FromUTF8(
-            "Published " + path_to_utf8(path_from_utf8(target).filename())));
+        SetStatusText(wxString::FromUTF8("Published " +
+                                         path_to_utf8(path_from_utf8(target)
+                                                          .filename())) +
+                      info_note);
         // The marker beside the document changes, and a first publication
         // turns up in the scan.
         files_->refresh();
@@ -2188,7 +2246,11 @@ void MainFrame::publish_stale(const std::string& folder)
     batch_done_ = 0;
     batch_errors_.clear();
     batch_return_ = return_to;
+    batch_stopped_ = 0;
     batch_active_ = true;
+    if (wxMenuBar* menus = GetMenuBar()) {
+        menus->Enable(kIdStopBatch, true);
+    }
     publish_next_in_batch();
 }
 
@@ -2229,6 +2291,9 @@ void MainFrame::finish_batch()
 {
     assert(batch_active_ && "only a running batch finishes");
     batch_active_ = false;
+    if (wxMenuBar* menus = GetMenuBar()) {
+        menus->Enable(kIdStopBatch, false);
+    }
     batch_queue_.clear();
     const std::size_t done = batch_done_;
     const std::vector<std::string> errors = batch_errors_;
@@ -2246,8 +2311,11 @@ void MainFrame::finish_batch()
     // Once, at the end: every publication just written changes a marker.
     files_->refresh();
 
-    SetStatusText(wxString::Format(L"Published %zu of %zu PDF(s).", done,
-                                   batch_total_));
+    SetStatusText(
+        wxString::Format(L"Published %zu of %zu PDF(s).", done, batch_total_) +
+        (batch_stopped_ > 0
+             ? wxString::Format(L"  Stopped: %zu not started.", batch_stopped_)
+             : wxString()));
     if (!errors.empty()) {
         std::string text;
         for (std::size_t i = 0; i < errors.size() && i < 20; ++i) {   // bounded

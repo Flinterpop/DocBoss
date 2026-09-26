@@ -29,6 +29,7 @@
 #include <string>
 #include <vector>
 
+#include "DocMeta.h"
 #include "PdfSettings.h"
 #include "PdfView.h"
 #include "mdboss/Config.h"
@@ -299,6 +300,11 @@ private:
     std::vector<std::string> batch_errors_;
     // What was showing when the batch started, to go back to.
     std::string batch_return_;
+    // How many were still queued when File > Stop publishing was used.
+    std::size_t batch_stopped_ = 0;
+    // What the document being printed says about itself (DocMeta.h): the
+    // page margins and, afterwards, the PDF's document properties.
+    DocMeta pending_meta_;
     DocumentWatcher watcher_;
 
     std::string current_path_;

@@ -6,8 +6,14 @@ find_package(md4c CONFIG REQUIRED)
 add_library(docboss_core STATIC
     ${MDBOSS_CORE_SOURCES}
     ${PDFBOSS_CORE_SOURCES}
+    DocDeps.cpp
+    DocDeps.h
+    DocMeta.cpp
+    DocMeta.h
     DocPairs.cpp
     DocPairs.h
+    PdfInfo.cpp
+    PdfInfo.h
     Identity.cpp
     Identity.h
     PdfSettings.cpp

@@ -16,7 +16,7 @@ Every file row carries a small icon:
 |---|---|
 | Plain page | A document that has never been published |
 | Page with a **green** band | Published, and the PDF is up to date — the row also says `[pdf]` |
-| Page with an **orange** band | Published, but the document has been edited since — the row turns orange and says `[stale]` |
+| Page with an **orange** band | Published, but out of date — the document, or a local image it shows, has changed since — the row turns orange and says `[stale]` |
 | Page with a **red** band | A PDF with no document beside it — a manual, a datasheet, anything somebody else wrote |
 
 A document's own PDF is **folded into the document's row** rather than listed beside it, so a folder of twenty published notes still shows twenty rows. PDFs from elsewhere get rows of their own, in grey, and count towards the folder's total.
@@ -29,9 +29,11 @@ Click a document to edit it; click a PDF to read it. **Only one file is open at 
 
 - **Save first.** Publish is refused while the document has unsaved edits — a published PDF has to say what the file on disk says, or it would be marked up to date while handing out text that exists nowhere.
 - **No YAML front matter.** A `--- … ---` block at the top of the document is always left out of the PDF, whether or not **Hide YAML** is on in the preview — it is metadata for you and the tech-note index, not for the reader. **Export as PDF…** leaves it out too.
+- **Page headers and footers.** Every page of a published or exported PDF carries the document's title and version at the top, and its date and *Page N of M* at the bottom, small and grey. The title comes from the front matter's `title:` (or the first heading, or the file name), the version from `version:`, the date from `date:` — or today's date when there is none. Turn them off with **File ▸ PDF page headers and footers**; the choice is remembered.
+- **Document properties.** The PDF's Title, Author, Subject and Keywords — what a PDF reader's Properties dialog and Windows search show — are filled in from the front matter's `title:`, `author:`, `subject:` and `keywords:`.
 - **What you see is what you get.** The PDF is the preview, printed: the same styling, code colours, mermaid diagrams, KaTeX and tables, laid out at the page width the preview already uses. DocBoss renders the page afresh and waits for it to finish drawing before printing, so a diagram is never caught half-drawn.
 - **Right-click any document in the tree ▸ Publish PDF** publishes that one — it is opened first if it is not already the open document.
-- **Publish all stale PDFs** (**File** menu) republishes every document marked stale, one after another, and then returns you to what you had open. Right-click a folder ▸ **Publish stale PDFs here** does the same for just that folder and those below it; the menu shows how many there are. You are asked once before it starts, since it replaces every one of those PDFs. Anything that could not be published is listed at the end.
+- **Publish all stale PDFs** (**File** menu) republishes every document marked stale, one after another, and then returns you to what you had open. Right-click a folder ▸ **Publish stale PDFs here** does the same for just that folder and those below it; the menu shows how many there are. You are asked once before it starts, since it replaces every one of those PDFs. **File ▸ Stop publishing** stops it after the PDF being written at the moment. Anything that could not be published is listed at the end.
 - **Open published PDF** (**Ctrl+Shift+O**, or right-click ▸ **Open published PDF**) shows the document's PDF in the viewer, to check it before sending it anywhere.
 - **Published PDFs are output.** Publishing again replaces the PDF, so highlights added to a *published* PDF are lost the next time it is published. Highlight other people's PDFs, not your own.
 

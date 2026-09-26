@@ -9,10 +9,14 @@
 // A publication is STALE when the source was written after it: whatever was
 // handed out no longer says what the document says.  Equal times count as
 // current -- a PDF exported in the same clock tick as a save is that save.
+// classify_pairs() decides that from the scan's times alone; DocDeps.h's
+// apply_dependency_times() then also marks stale a PDF older than any local
+// image its document shows.
 
 #ifndef DOCBOSS_APP_DOC_PAIRS_H
 #define DOCBOSS_APP_DOC_PAIRS_H
 
+#include <cstdint>
 #include <map>
 #include <string>
 #include <vector>
@@ -30,6 +34,7 @@ enum class PdfState {
 struct PdfLink {
     std::string md_path;    // the document, UTF-8, absolute, as scanned
     std::string pdf_path;   // UTF-8, absolute
+    std::int64_t pdf_modified = 0;   // the PDF's last write, as scanned
     PdfState state = PdfState::kNone;
 };
 

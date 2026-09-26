@@ -43,6 +43,7 @@ Pairing classify_pairs(const std::vector<mdboss::DocEntry>& documents,
         PdfLink link;
         link.md_path = doc.path;
         link.pdf_path = pdf.path;
+        link.pdf_modified = pdf.modified;
         // A time that could not be read is 0; treat an unknown source time
         // as "not newer", so a failure to read never cries stale.
         link.state = (doc.modified > pdf.modified) ? PdfState::kStale

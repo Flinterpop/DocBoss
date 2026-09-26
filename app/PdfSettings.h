@@ -42,6 +42,11 @@ public:
     const std::string& fit() const { return fit_; }
     void set_fit(const std::string& fit);
 
+    // Whether printed PDFs carry the title / version / date / page-number
+    // header and footer.  On unless turned off.
+    bool page_headers() const { return page_headers_; }
+    void set_page_headers(bool on) { page_headers_ = on; }
+
     // Pixels; 0 means "not recorded, use the default".
     int topics_sash() const { return topics_sash_; }
     void set_topics_sash(int pixels) { topics_sash_ = pixels; }
@@ -53,6 +58,7 @@ private:
     // (normalised path, 0-based page), most recent first.
     std::vector<std::pair<std::string, int>> pages_;
     std::string fit_ = "width";
+    bool page_headers_ = true;
     int topics_sash_ = 0;
     int bookmarks_sash_ = 0;
 };

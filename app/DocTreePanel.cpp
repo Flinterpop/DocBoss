@@ -28,6 +28,7 @@
 #include <sstream>
 #include <thread>
 
+#include "DocDeps.h"
 #include "Publish.h"
 #include "mdboss/FileScan.h"
 #include "mdboss/PathUtf8.h"
@@ -457,6 +458,14 @@ void DocTreePanel::start_scan()
         }
         // Paired here, on the worker, so the UI thread only swaps results in.
         Pairing pairing = classify_pairs(entries, pdfs);
+        // A replaced figure dates the PDF as surely as edited text.  This
+        // reads the documents that still look current -- and only those --
+        // so it belongs here on the worker, never on the UI thread.
+        try {
+            apply_dependency_times(pairing);
+        } catch (...) {
+            // A document that cannot be read keeps the answer the times gave.
+        }
         // A loose PDF is a row of its own, so it counts in its folders' totals
         // -- a folder holding only somebody else's PDFs read "(0)" otherwise.
         // A publication does not: it is part of its document's row.

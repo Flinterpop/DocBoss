@@ -19,6 +19,7 @@ constexpr const char* kPagesKey = "docboss_pdf_pages";
 constexpr const char* kFitKey = "docboss_pdf_fit";
 constexpr const char* kTopicsSashKey = "docboss_topics_sash";
 constexpr const char* kBookmarksSashKey = "docboss_bookmarks_sash";
+constexpr const char* kPageHeadersKey = "docboss_pdf_page_headers";
 
 bool valid_fit(const std::string& fit)
 {
@@ -79,6 +80,9 @@ void PdfSettings::load()
     if (document.contains(kFitKey) && document[kFitKey].is_string()) {
         set_fit(document[kFitKey].get<std::string>());
     }
+    page_headers_ = !(document.contains(kPageHeadersKey) &&
+                      document[kPageHeadersKey].is_boolean() &&
+                      !document[kPageHeadersKey].get<bool>());
     topics_sash_ = int_or(document, kTopicsSashKey, 0);
     bookmarks_sash_ = int_or(document, kBookmarksSashKey, 0);
     assert(pages_.size() <= kMaxRememberedPages);
@@ -93,6 +97,7 @@ bool PdfSettings::save() const
     }
     document[kPagesKey] = pages;
     document[kFitKey] = fit_;
+    document[kPageHeadersKey] = page_headers_;
     document[kTopicsSashKey] = topics_sash_;
     document[kBookmarksSashKey] = bookmarks_sash_;
 
