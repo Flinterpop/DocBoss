@@ -1,0 +1,3008 @@
+#include "MainFrame.h"
+
+#include <wx/choicdlg.h>
+#include <wx/filedlg.h>
+#include <wx/filename.h>
+#include <wx/menu.h>
+#include <wx/msgdlg.h>
+#include <wx/textdlg.h>
+#include <wx/sizer.h>
+#include <wx/textfile.h>
+#include <wx/stdpaths.h>
+#include <wx/accel.h>
+#include <wx/artprov.h>
+#include <wx/toolbar.h>
+
+#include <algorithm>
+#include <cmath>
+#include <cassert>
+#include <ctime>
+#include <filesystem>
+#include <fstream>
+#include <map>
+#include <sstream>
+
+#include "mdboss/DropTarget.h"
+#include "mdboss/Favorites.h"
+#include "mdboss/FileAssoc.h"
+#include "mdboss/FileScan.h"
+#include "mdboss/FindBar.h"
+#include "mdboss/FindInFilesDialog.h"
+#include "mdboss/FoldersDialog.h"
+#include "Publish.h"
+#include "Version.h"
+#include "HelpDialog.h"
+#include "mdboss/InternalDialogs.h"
+#include "mdboss/InternalNotes.h"
+#include "mdboss/TechNotes.h"
+#include "mdboss/PathUtf8.h"
+#include "mdboss/SingleInstance.h"
+#include "mdboss/Templates.h"
+#include "mdboss/Updater.h"
+#include "mdrender/MdRender.h"
+
+namespace docboss {
+
+using namespace mdboss;
+namespace {
+
+// Matches app.py's PREVIEW_DEBOUNCE_MS: long enough that typing does not
+// re-render on every keystroke, short enough to feel live.
+constexpr int kRenderDebounceMs = 300;
+// How long the preview's scroll echo is ignored after we scroll it
+// ourselves.  ExecuteScript is asynchronous: it returns before the preview
+// has moved, and the echo arrives later still, so the guard has to outlive
+// the call rather than wrap it.  Matches the Python app's 120 ms.
+constexpr int kScrollEchoMs = 120;
+
+// Distinct ids because a wxTimer constructed with an owner posts its events
+// to that owner: two timers on this frame with the default id would both
+// arrive at whichever handler was bound without one.
+constexpr int kIdRenderTimer = wxID_HIGHEST + 20;
+constexpr int kIdScrollEchoTimer = wxID_HIGHEST + 21;
+
+constexpr int kIdToggleFrontMatter = wxID_HIGHEST + 1;
+constexpr int kIdManageFolders = wxID_HIGHEST + 2;
+constexpr int kIdToggleFavorite = wxID_HIGHEST + 3;
+constexpr int kIdNewFromTemplate = wxID_HIGHEST + 4;
+constexpr int kIdOpenTemplates = wxID_HIGHEST + 5;
+constexpr int kIdRefresh = wxID_HIGHEST + 6;
+constexpr int kIdToggleFiles = wxID_HIGHEST + 7;
+constexpr int kIdToggleOutline = wxID_HIGHEST + 8;
+constexpr int kIdToggleEditor = wxID_HIGHEST + 9;
+constexpr int kIdFileTypes = wxID_HIGHEST + 10;
+constexpr int kIdHelp = wxID_HIGHEST + 11;
+constexpr int kIdCheckUpdates = wxID_HIGHEST + 12;
+// Not wxID_CLOSE: that is the frame's own close command, and wx routes it to
+// the window rather than to a handler of ours -- the app would exit.
+constexpr int kIdCloseDocument = wxID_HIGHEST + 13;
+constexpr int kIdInsertImage = wxID_HIGHEST + 14;
+// The three MD_Internal list commands.  Below kIdSnippetBase, which starts the
+// only open-ended range in this file.
+constexpr int kIdAddLogin = wxID_HIGHEST + 15;
+constexpr int kIdAddTodo = wxID_HIGHEST + 16;
+constexpr int kIdAddDiary = wxID_HIGHEST + 17;
+constexpr int kIdOpenInternal = wxID_HIGHEST + 18;
+constexpr int kIdExportPdf = wxID_HIGHEST + 19;
+constexpr int kIdTogglePreview = wxID_HIGHEST + 22;
+constexpr int kIdTechNotes = wxID_HIGHEST + 23;
+constexpr int kIdPromoteDocument = wxID_HIGHEST + 24;
+constexpr int kIdAddFact = wxID_HIGHEST + 25;
+constexpr int kIdRefreshTechNotes = wxID_HIGHEST + 26;
+constexpr int kIdBack = wxID_HIGHEST + 27;
+constexpr int kIdForward = wxID_HIGHEST + 28;
+constexpr int kIdFind = wxID_HIGHEST + 29;
+constexpr int kIdFindNext = wxID_HIGHEST + 30;
+constexpr int kIdFindPrevious = wxID_HIGHEST + 31;
+constexpr int kIdFindInFiles = wxID_HIGHEST + 32;
+constexpr int kIdPublish = wxID_HIGHEST + 33;
+constexpr int kIdOpenPublished = wxID_HIGHEST + 34;
+constexpr int kIdBookmarkPage = wxID_HIGHEST + 35;
+
+constexpr int kIdPublishTimer = wxID_HIGHEST + 36;
+
+// Publish prints a freshly rendered page.  The settle delay runs from the
+// page's load, giving mermaid and KaTeX -- which draw on DOMContentLoaded --
+// time to finish; the fallback runs from the request, in case the load signal
+// never arrives, so Publish can never stay stuck.
+constexpr int kPublishSettleMs = 600;
+constexpr int kPublishFallbackMs = 5000;
+
+// The two pages of the content book.
+constexpr std::size_t kMarkdownPage = 0;
+constexpr std::size_t kPdfPage = 1;
+
+// Bounds on the Find bar (Rule of 10).  The first caps the counting pass a
+// keystroke triggers -- a document matching on every line must not turn
+// typing into a stall -- and the count says so rather than rounding down
+// silently.  The second stops a whole selected chapter being pasted into a
+// one-line query box.
+constexpr std::size_t kMaxFindHits = 1000;
+constexpr std::size_t kMaxFindSeed = 2000;
+
+// How many documents back you can go.  A bound rather than a whole session's
+// worth (Rule of 10): the list is only useful a few steps deep, and it holds
+// paths that a long session would otherwise accumulate without limit.
+constexpr std::size_t kMaxHistory = 100;
+// Preview themes.  Radio items, so the menu shows which one is active rather
+// than two tick boxes that can both look off.
+constexpr int kIdThemeGitHub = wxID_HIGHEST + 20;
+constexpr int kIdThemeNotes = wxID_HIGHEST + 21;
+// Snippets take ids from here up, one per kSnippets entry.  Bounded (Rule of
+// 10): the array is fixed at compile time, so the range cannot run past the
+// next constant.
+constexpr int kIdSnippetBase = wxID_HIGHEST + 40;
+
+// Matching the formats a browser will actually display, since the preview is
+// one.  TIFF and PSD are deliberately absent: they would insert a reference
+// that renders as a broken image.
+const char* const kImageWildcard =
+    "Image files (*.png;*.jpg;*.jpeg;*.gif;*.svg;*.webp;*.bmp)|"
+    "*.png;*.jpg;*.jpeg;*.gif;*.svg;*.webp;*.bmp|All files (*.*)|*.*";
+
+// The five GitHub alert kinds, in GitHub's own order of severity.  The
+// renderer already turns these into styled callouts -- see
+// mdrender/src/Preprocess.cpp -- so what a snippet inserts previews the same
+// way it will on GitHub.
+//
+// The marker line carries no trailing spaces.  GitHub's documentation shows
+// two on some of these, which Markdown reads as a hard line break; the alert
+// syntax does not need one and the house style bans them.
+struct Snippet {
+    const wchar_t* label;
+    const char* body;
+};
+
+const Snippet kSnippets[] = {
+    {L"&Note",
+     "> [!NOTE]\n"
+     "> Highlights information that users should take into account, even when "
+     "skimming.\n"},
+    {L"&Tip",
+     "> [!TIP]\n"
+     "> Optional information to help a user be more successful.\n"},
+    {L"&Important",
+     "> [!IMPORTANT]\n"
+     "> Crucial information necessary for users to succeed.\n"},
+    {L"&Warning",
+     "> [!WARNING]\n"
+     "> Critical content demanding immediate user attention due to potential "
+     "risks.\n"},
+    {L"&Caution",
+     "> [!CAUTION]\n"
+     "> Negative potential consequences of an action.\n"},
+    // Rendered by the bundled mermaid.js -- see HtmlRenderer.cpp, which turns a
+    // ```mermaid fence into <pre class="mermaid"> rather than a code block.
+    //
+    // Flowchart node labels are quoted because the parser needs them to be:
+    // an unquoted label containing &, / or parentheses is a silent parse
+    // failure, and a diagram that fails to parse renders as nothing at all.
+    {L"&Mermaid diagram",
+     "```mermaid\n"
+     "flowchart LR\n"
+     "    A[\"Start\"] --> B[\"Next step\"]\n"
+     "    B --> C[\"Done\"]\n"
+     "```\n"},
+    // Three columns of two rows: enough to show the shape, small enough to
+    // delete what is not wanted.  The separator row is what makes it a table
+    // rather than three lines of text, so it is spelled out rather than left
+    // to the user to remember.
+    {L"Ta&ble",
+     "| Column | Column | Column |\n"
+     "|--------|--------|--------|\n"
+     "|        |        |        |\n"
+     "|        |        |        |\n"},
+};
+
+// Kept in step with app.py's MARKDOWN_EXTS.
+const char* const kOpenWildcard =
+    "Markdown files (*.md;*.markdown;*.mdown;*.mkd;*.mdwn)|"
+    "*.md;*.markdown;*.mdown;*.mkd;*.mdwn|All files (*.*)|*.*";
+
+// File > Open takes either kind of file; Save stays Markdown only.
+const char* const kOpenAnyWildcard =
+    "Documents and PDFs (*.md;*.markdown;*.mdown;*.mkd;*.mdwn;*.pdf)|"
+    "*.md;*.markdown;*.mdown;*.mkd;*.mdwn;*.pdf|"
+    "Markdown files (*.md;*.markdown;*.mdown;*.mkd;*.mdwn)|"
+    "*.md;*.markdown;*.mdown;*.mkd;*.mdwn|PDF files (*.pdf)|*.pdf|"
+    "All files (*.*)|*.*";
+
+std::string read_text_file(const std::string& path, bool& ok)
+{
+    std::ifstream stream(path_from_utf8(path), std::ios::binary);
+    if (!stream) {
+        ok = false;
+        return {};
+    }
+    std::ostringstream buffer;
+    buffer << stream.rdbuf();
+    ok = true;
+    return strip_utf8_bom(buffer.str());
+}
+
+// The first `limit` bytes only.  Enough to answer a question about front
+// matter, which is always at the top, without reading a 4 MB document to grey
+// out one menu item.
+std::string read_text_file_head(const std::string& path, std::size_t limit,
+                                bool& ok)
+{
+    assert(limit > 0 && "a head of nothing answers nothing");
+    std::ifstream stream(path_from_utf8(path), std::ios::binary);
+    if (!stream) {
+        ok = false;
+        return {};
+    }
+    std::string head(limit, '\0');
+    stream.read(head.data(), static_cast<std::streamsize>(limit));
+    head.resize(static_cast<std::size_t>(stream.gcount()));
+    ok = true;
+    return strip_utf8_bom(head);
+}
+
+// A file:/// URL for the document's own folder, with the trailing slash
+// render_document() requires so relative images resolve.
+std::string base_href_for(const std::string& path)
+{
+    std::filesystem::path dir = path_from_utf8(path).parent_path();
+    if (dir.empty()) {
+        dir = std::filesystem::current_path();
+    }
+    // generic_u8string(): forward slashes for the URL, and UTF-8 rather than
+    // the ANSI conversion string() would do (which throws on unmappable
+    // characters).
+    const std::u8string generic = dir.generic_u8string();
+    std::string text(reinterpret_cast<const char*>(generic.data()),
+                     generic.size());
+    if (text.empty() || text.back() != '/') {
+        text += '/';
+    }
+    return "file:///" + text;
+}
+
+// Carries wxTopLevelWindow's geometry fields to and from the config's map.
+// On MSW they come from GetWindowPlacement(), so the size saved while
+// maximised is the NORMAL one -- GetSize() there reports the maximised size,
+// which then came back as an un-maximised window the size of the screen.
+class ConfigGeometryStore : public wxTopLevelWindow::GeometryStore {
+public:
+    explicit ConfigGeometryStore(std::map<std::string, int> values)
+        : values_(std::move(values))
+    {
+    }
+
+    bool SaveValue(const wxString& name, int value) override
+    {
+        assert(!name.empty());
+        values_[std::string(name.ToUTF8())] = value;
+        return true;
+    }
+
+    bool RestoreValue(const wxString& name, int* value) const override
+    {
+        assert(value != nullptr);
+        // Reopening minimised is never what anyone wants: the window would
+        // start on the taskbar with nothing on screen to say it launched.
+        if (name == "Iconized") {
+            return false;
+        }
+        const auto it = values_.find(std::string(name.ToUTF8()));
+        if (it == values_.end()) {
+            return false;
+        }
+        *value = it->second;
+        return true;
+    }
+
+    const std::map<std::string, int>& values() const { return values_; }
+
+private:
+    std::map<std::string, int> values_;
+};
+
+}  // namespace
+
+MainFrame::MainFrame()
+    : wxFrame(nullptr, wxID_ANY, "DocBoss"),
+      render_timer_(this, kIdRenderTimer),
+      scroll_echo_timer_(this, kIdScrollEchoTimer),
+      publish_timer_(this, kIdPublishTimer),
+      // Safe to hand `this` over during construction: the watcher only ever
+      // calls back from the event loop, which is not running yet.
+      watcher_([this](const std::string& path, bool still_exists) {
+          on_document_changed(path, still_exists);
+      }),
+      pdf_settings_(Config::path())
+{
+    config_.load();
+    pdf_settings_.load();
+    // At startup, as the Python app does: a starter added in this version has
+    // to reach a profile whose templates folder already exists, and waiting
+    // for someone to open that folder means it never appears in the menus
+    // where templates are actually picked.
+    seed_starter_templates();
+    SetMinSize(wxSize(640, 400));
+    // Size alone is the fallback for a profile saved before geometry was:
+    // position, and whether the window was maximised, were never recorded.
+    SetSize(config_.window_width(), config_.window_height());
+    if (!config_.window_geometry().empty()) {
+        // Before Show(), so the window appears where it was rather than
+        // jumping there.  SetWindowPlacement pulls a window whose monitor
+        // has gone back onto one that exists.
+        const ConfigGeometryStore store(config_.window_geometry());
+        RestoreToGeometry(store);
+    }
+
+    // Load the icon as a RESOURCE, not by reading the exe as an image file.
+    // The file form needs an ICO image handler registered and, without one,
+    // pops "No image handler for type 3 defined" at every launch -- while the
+    // title bar looked right anyway, because Windows falls back to the exe's
+    // own first icon. "#1" is the ordinal the .rc assigns it.
+    wxIcon icon;
+    if (icon.LoadFile("#1", wxBITMAP_TYPE_ICO_RESOURCE)) {
+        SetIcon(icon);
+    }
+
+    CreateStatusBar();
+
+    build_menu();
+    build_panes();
+    build_toolbar();   // after the panes: the toggles reflect their state
+    bind_events();
+    update_title();
+}
+
+void MainFrame::build_menu()
+{
+    auto* file = new wxMenu();
+    file->Append(wxID_NEW, "&New\tCtrl+N");
+    file->Append(kIdNewFromTemplate, L"New from &template…\tCtrl+Shift+N");
+    file->Append(wxID_OPEN, L"&Open…\tCtrl+O");
+    file->Append(wxID_SAVE, "&Save\tCtrl+S");
+    file->Append(kIdCloseDocument, "&Close document\tCtrl+W");
+    file->AppendSeparator();
+    // Publish is the everyday command: no dialog, the PDF lands beside the
+    // document.  Export stays for the one-off copy saved somewhere else.
+    file->Append(kIdPublish, L"&Publish PDF\tCtrl+Shift+P");
+    file->Append(kIdOpenPublished, L"Open pu&blished PDF\tCtrl+Shift+O");
+    file->Append(kIdExportPdf, L"&Export as PDF…");
+    file->AppendSeparator();
+    file->Append(kIdOpenTemplates, "Open &templates folder");
+    file->Append(kIdManageFolders, L"&Manage folders…");
+    file->Append(kIdToggleFavorite, "Add to &favorites\tCtrl+D");
+    file->AppendSeparator();
+    file->Append(wxID_EXIT, "E&xit\tAlt+F4");
+
+    auto* view = new wxMenu();
+    view->AppendCheckItem(kIdToggleFrontMatter,
+                          "Hide &YAML front matter\tCtrl+Y");
+    view->Check(kIdToggleFrontMatter, config_.hide_front_matter());
+    view->AppendSeparator();
+    view->AppendRadioItem(kIdThemeGitHub, "Preview style: &GitHub");
+    view->AppendRadioItem(kIdThemeNotes, "Preview style: &Notes");
+    // Ticked from the stored name, not from a remembered index: an
+    // unrecognised value renders as GitHub, so the menu has to agree with what
+    // the renderer will actually do.
+    view->Check(mdrender::theme_from_name(config_.preview_theme()) ==
+                        mdrender::Theme::kNotes
+                    ? kIdThemeNotes
+                    : kIdThemeGitHub,
+                true);
+
+    // A menu of its own rather than more entries on View: neither command is
+    // about what is on screen, and the pair is what people go to the menu bar
+    // looking for.
+    auto* search = new wxMenu();
+    search->Append(kIdFind, L"&Find in this document\tCtrl+F");
+    search->Append(kIdFindNext, L"Find &next\tF3");
+    search->Append(kIdFindPrevious, L"Find &previous\tShift+F3");
+    search->AppendSeparator();
+    search->Append(kIdFindInFiles,
+                   L"Find in &all documents…\tCtrl+Shift+F");
+    search->AppendSeparator();
+    // A PDF's own page bookmarks, kept beside it by PDFBoss's rules.
+    search->Append(kIdBookmarkPage, L"&Bookmark this PDF page\tCtrl+B");
+
+    auto* snippets = new wxMenu();
+    for (std::size_t i = 0; i < std::size(kSnippets); ++i) {   // bounded
+        snippets->Append(kIdSnippetBase + static_cast<int>(i),
+                         kSnippets[i].label);
+    }
+    // Below a separator: the others insert fixed text, this one asks first.
+    snippets->AppendSeparator();
+    // "&f", not "&i": Important already claims I, and two items sharing a
+    // mnemonic makes the key cycle between them instead of choosing one.
+    snippets->Append(kIdInsertImage, L"Insert image &file…");
+
+    // The three MD_Internal lists.  A menu of their own rather than more
+    // entries on File: they are not about the open document, they are three
+    // standing lists the app keeps for you.
+    auto* lists = new wxMenu();
+    lists->Append(kIdAddLogin, L"Add a &login record…");
+    lists->Append(kIdAddTodo, L"Add a &to-do…\tCtrl+T");
+    lists->Append(kIdAddDiary, L"Add a Grail &Diary entry…");
+    lists->Append(kIdAddFact, L"Add a &fact…");
+    lists->AppendSeparator();
+    // Named for the thing, not the verb: "Rebuild the tech-note index"
+    // describes what the command does to a file, which is no help to someone
+    // looking for their tech notes.  "T" is taken by "Add a &to-do" in this
+    // menu, and a duplicate mnemonic cycles instead of invoking.
+    auto* tech = new wxMenu();
+    tech->Append(kIdTechNotes, L"&Show the list");
+    tech->Append(kIdRefreshTechNotes, L"&Refresh the list\tCtrl+Shift+R");
+    tech->Append(kIdPromoteDocument, L"&Update this document as a tech note");
+    lists->AppendSubMenu(tech, L"Tech &Notes");
+    lists->AppendSeparator();
+    // Without this the three files are only reachable by hunting for the
+    // folder in the tree, which is a poor way to read a list you just added to.
+    lists->Append(kIdOpenInternal,
+                  wxString(L"&Open ") + kInternalName + L" folder");
+
+    auto* help = new wxMenu();
+    // F1 rides the menu item, so it needs no accelerator table entry.
+    help->Append(kIdHelp, "&Help\tF1");
+    help->Append(kIdCheckUpdates, L"Check for &updates…");
+    help->AppendSeparator();
+    help->Append(wxID_ABOUT, wxString("&About ") + kAppName + L"…");
+
+    auto* bar = new wxMenuBar();
+    bar->Append(file, "&File");
+    bar->Append(view, "&View");
+    bar->Append(search, "&Search");
+    bar->Append(snippets, "&Snippets");
+    bar->Append(lists, "&Lists");
+    bar->Append(help, "&Help");
+    SetMenuBar(bar);
+}
+
+void MainFrame::build_toolbar()
+{
+    // Icons from wxArtProvider rather than a shipped bitmap set: they follow
+    // the platform's own theme and there is nothing extra to package.  The
+    // button's label is carried in the tooltip, since the buttons no longer
+    // show text.
+    struct Tool {
+        int id;
+        const wchar_t* label;
+        const wxArtID art;
+        const wchar_t* detail;   // appended after the label in the tooltip
+        bool check;
+        bool separator_after;
+    };
+
+    const Tool tools[] = {
+        // First, and on its own: it is about where you have been rather than
+        // about the roots or the open document, and it is the one button
+        // whose position people expect to know without looking.
+        {kIdBack, L"Back", wxART_GO_BACK,
+         L"Return to the document you were reading before this one "
+         L"(Alt+Left)", false, false},
+        {kIdForward, L"Forward", wxART_GO_FORWARD,
+         L"Return to the document you came back from (Alt+Right)", false,
+         true},
+
+        {kIdManageFolders, L"Manage folders…", wxART_FOLDER_OPEN,
+         L"Add, remove, or reorder root folders", false, false},
+        {kIdRefresh, L"Refresh", wxART_REFRESH, L"Rescan all roots (F5)",
+         false, true},
+
+        {wxID_OPEN, L"Open…", wxART_FILE_OPEN,
+         L"Open a Markdown file from anywhere on disk (Ctrl+O)", false, false},
+        {wxID_NEW, L"New", wxART_NEW, L"Create a new Markdown file (Ctrl+N)",
+         false, false},
+        {kIdNewFromTemplate, L"New from template…", wxART_NORMAL_FILE,
+         L"Create a new file from a template", false, false},
+        {wxID_SAVE, L"Save", wxART_FILE_SAVE,
+         L"Save the current document (Ctrl+S)", false, false},
+        {kIdPublish, L"Publish PDF", wxART_PRINT,
+         L"Write this document's PDF beside it, replacing the last one "
+         L"(Ctrl+Shift+P)", false, false},
+        {kIdCloseDocument, L"Close", wxART_CLOSE,
+         L"Close the open document and empty the editor (Ctrl+W)", false,
+         true},
+
+        // Toggles ordered to match the columns: Files | Outline | Edit.
+        {kIdToggleFiles, L"Files", wxART_LIST_VIEW,
+         L"Show or hide the file tree", true, false},
+        {kIdToggleOutline, L"Outline", wxART_REPORT_VIEW,
+         L"Show or hide the outline pane", true, false},
+        {kIdToggleEditor, L"Edit", wxART_EDIT,
+         L"Show or hide the source editor", true, false},
+        {kIdTogglePreview, L"Preview", wxART_FIND,
+         L"Show or hide the rendered preview", true, false},
+        {kIdToggleFrontMatter, L"Hide YAML", wxART_MINUS,
+         L"Hide a YAML front-matter block at the top of the file", true, true},
+
+        // Help lives on the Help menu, not here: it is not something reached
+        // often enough to earn a permanent button.
+        {kIdFileTypes, L"File types…", wxART_EXECUTABLE_FILE,
+         L"Register DocBoss as a handler for Markdown files", false, false},
+    };
+
+    wxToolBar* bar = CreateToolBar(wxTB_HORIZONTAL | wxTB_FLAT);
+    for (const Tool& tool : tools) {
+        // The tooltip leads with the label, so an icon whose meaning is not
+        // obvious still names itself.
+        // The separator must be a WIDE literal.  A narrow one holding an
+        // em-dash is handed to wxString as bytes and decoded in the ANSI code
+        // page, which showed up in every tooltip as mojibake.  A test below
+        // now scans the sources for this, because it is easy to repeat.
+        const wxString tip =
+            wxString(tool.label) + L"  —  " + wxString(tool.detail);
+        const wxBitmapBundle icon =
+            wxArtProvider::GetBitmapBundle(tool.art, wxART_TOOLBAR);
+        if (tool.check) {
+            bar->AddCheckTool(tool.id, tool.label, icon, wxBitmapBundle(), tip);
+        } else {
+            // The greyed bitmap is supplied rather than left to wxMSW to
+            // generate: the one it made for wxART_CLOSE was indistinguishable
+            // from the enabled icon, so a disabled Close looked perfectly
+            // clickable.  The tool really was disabled -- it just did not say
+            // so, which is worse than either state on its own.
+            const wxBitmap normal = icon.GetBitmap(wxDefaultSize);
+            const wxBitmapBundle greyed =
+                normal.IsOk()
+                    ? wxBitmapBundle::FromBitmap(normal.ConvertToDisabled())
+                    : wxBitmapBundle();
+            bar->AddTool(tool.id, tool.label, icon, greyed, wxITEM_NORMAL, tip);
+        }
+        if (tool.separator_after) {
+            bar->AddSeparator();
+        }
+    }
+
+    bar->ToggleTool(kIdToggleFiles, config_.show_files());
+    bar->ToggleTool(kIdToggleOutline, config_.show_outline());
+    bar->ToggleTool(kIdToggleEditor, config_.show_editor());
+    bar->ToggleTool(kIdTogglePreview, config_.show_preview());
+    bar->ToggleTool(kIdToggleFrontMatter, config_.hide_front_matter());
+    bar->Realize();
+    // Nothing to go back to yet, and a button that looks clickable but does
+    // nothing is worse than one that says so.
+    update_nav_state();
+
+    // Refresh has no menu item, so F5 needs an accelerator of its own.  F1
+    // does not: it rides the Help menu entry.  Back has no menu item either,
+    // and takes the Alt+Left every browser uses.
+    const wxAcceleratorEntry accelerators[] = {
+        wxAcceleratorEntry(wxACCEL_NORMAL, WXK_F5, kIdRefresh),
+        wxAcceleratorEntry(wxACCEL_ALT, WXK_LEFT, kIdBack),
+        wxAcceleratorEntry(wxACCEL_ALT, WXK_RIGHT, kIdForward),
+    };
+    SetAcceleratorTable(
+        wxAcceleratorTable(static_cast<int>(std::size(accelerators)),
+                           accelerators));
+}
+
+void MainFrame::build_panes()
+{
+    // files | (outline | (editor | preview)).  wxSplitterWindow is binary, so
+    // three of them nest to make four panes.
+    files_split_ = new wxSplitterWindow(this, wxID_ANY, wxDefaultPosition,
+                                        wxDefaultSize,
+                                        wxSP_LIVE_UPDATE | wxSP_THIN_SASH);
+    files_split_->SetMinimumPaneSize(140);
+
+    recent_split_ = new wxSplitterWindow(files_split_, wxID_ANY,
+                                         wxDefaultPosition, wxDefaultSize,
+                                         wxSP_LIVE_UPDATE | wxSP_THIN_SASH);
+    recent_split_->SetMinimumPaneSize(80);
+    recent_ = new PathListPanel(recent_split_, "Recent", "");
+    recent_->set_on_activate([this](const std::string& p) { open_path(p); });
+    recent_->set_on_clear([this] {
+        config_.clear_recents();
+        config_.save();
+        refresh_lists();
+    });
+
+    favorites_split_ = new wxSplitterWindow(recent_split_, wxID_ANY,
+                                            wxDefaultPosition, wxDefaultSize,
+                                            wxSP_LIVE_UPDATE | wxSP_THIN_SASH);
+    favorites_split_->SetMinimumPaneSize(80);
+    favorites_ =
+        new PathListPanel(favorites_split_, "Favorites", "&Remove favorite");
+    favorites_->set_on_activate([this](const std::string& p) { open_path(p); });
+    favorites_->set_on_extra([this](const std::string& p) {
+        config_.remove_favorite(p);
+        config_.save();
+        refresh_lists();
+    });
+    favorites_->set_on_clear([this] {
+        config_.clear_favorites();
+        config_.save();
+        refresh_lists();
+    });
+    favorites_->add_menu_command(L"&Export favorites…",
+                                 [this] { on_export_favorites(); });
+    favorites_->add_menu_command(L"&Import favorites…",
+                                 [this] { on_import_favorites(); });
+
+    files_ = new DocTreePanel(favorites_split_);
+    files_->set_on_open([this](const std::string& path) { open_path(path); });
+    files_->set_on_preview([this](const std::string& path) {
+        open_path(path, OpenMode::kBrowse);
+    });
+    files_->set_on_import_to_inbox([this] { on_import_to_inbox(); });
+    files_->set_on_publish(
+        [this](const std::string& path) { publish_document(path); });
+    files_->set_on_path_moved([this](const std::string& from,
+                                     const std::string& to) {
+        on_path_moved(from, to);
+    });
+    files_->set_on_promote_tech_note(
+        [this](const std::string& path) { promote_tech_note(path); },
+        [](const std::string& path) {
+            // Only the head is read, and only to grey the menu item out.  The
+            // command itself re-reads and re-checks: the file may have changed
+            // between the menu opening and the item being clicked.
+            bool ok = false;
+            const std::string head = read_text_file_head(path, 4096, ok);
+            if (!ok) {
+                return false;
+            }
+            const TechNoteGaps gaps = tech_note_gaps(head);
+            return !gaps.front_matter && !gaps.guid && !gaps.keyword &&
+                   !gaps.tn_index;
+        });
+    files_->set_manage_hooks(
+        [this] {
+            wxCommandEvent unused;
+            on_open_templates_folder(unused);
+        },
+        [this] {
+            wxCommandEvent unused;
+            on_manage_folders(unused);
+        });
+    files_->set_favorite_hooks(
+        [this](const std::string& path) {
+            if (config_.is_favorite(path)) {
+                config_.remove_favorite(path);
+            } else {
+                config_.add_favorite(path);
+            }
+            config_.save();
+            refresh_lists();
+        },
+        [this](const std::string& path) { return config_.is_favorite(path); });
+    files_->set_flat_hooks(
+        [this](const std::string& path) {
+            return config_.is_flat_folder(path);
+        },
+        [this](const std::string& path) {
+            config_.set_flat_folder(path, !config_.is_flat_folder(path));
+            config_.save();
+        });
+    files_->set_exclude_hooks(
+        [this](const std::string& path) {
+            return config_.is_excluded_folder(path);
+        },
+        [this](const std::string& path) {
+            config_.set_excluded_folder(path,
+                                        !config_.is_excluded_folder(path));
+            config_.save();
+        },
+        [this]() { return config_.excluded_folders(); });
+
+    // The right-hand side is a book: the Markdown page is MD Boss's layout
+    // unchanged, the PDF page is PDFBoss's viewer.  Both are built once and
+    // kept; switching never destroys the WebView2, whose controller is slow
+    // to create and has failed silently when recreated under load.
+    content_ = new wxSimplebook(files_split_, wxID_ANY);
+    outline_split_ = new wxSplitterWindow(content_, wxID_ANY,
+                                          wxDefaultPosition, wxDefaultSize,
+                                          wxSP_LIVE_UPDATE | wxSP_THIN_SASH);
+    outline_split_->SetMinimumPaneSize(140);
+
+    outline_ = new OutlinePanel(outline_split_);
+    outline_->set_on_activate([this](const std::string& slug) {
+        preview_->scroll_to_anchor(slug);
+    });
+
+    split_ = new wxSplitterWindow(outline_split_, wxID_ANY, wxDefaultPosition,
+                                  wxDefaultSize,
+                                  wxSP_LIVE_UPDATE | wxSP_THIN_SASH);
+    split_->SetMinimumPaneSize(160);
+
+    editor_ = new wxStyledTextCtrl(split_, wxID_ANY);
+    // Scintilla gives the line-number gutter and current-line highlight the
+    // Python app paints by hand in CodeEditor.
+    editor_->SetLexer(wxSTC_LEX_MARKDOWN);
+    editor_->SetMarginType(0, wxSTC_MARGIN_NUMBER);
+    editor_->SetMarginWidth(0, 48);
+    editor_->SetCaretLineVisible(true);
+    editor_->SetCaretLineBackground(wxColour(245, 245, 245));
+    editor_->SetWrapMode(wxSTC_WRAP_WORD);
+    editor_->StyleSetFaceName(wxSTC_STYLE_DEFAULT, "Consolas");
+    editor_->StyleSetSize(wxSTC_STYLE_DEFAULT, 10);
+    editor_->StyleClearAll();
+
+    preview_ = new PreviewPane(split_);
+    preview_->set_on_scrolled([this](double ratio) {
+        on_preview_scrolled(ratio);
+    });
+    // A link to another document opens it here rather than in a browser.  Via
+    // CallAfter because this runs from inside a WebView2 navigation callback,
+    // and open_path() can put up a modal dialog -- doing that while the
+    // browser is mid-navigation is asking for a re-entrancy problem.
+    preview_->set_on_open_document([this](const std::string& path) {
+        CallAfter([this, path] { open_path(path); });
+    });
+    preview_->set_on_page_loaded([this] { on_page_loaded(); });
+
+    split_->SplitVertically(editor_, preview_, config_.editor_sash());
+    outline_split_->SplitVertically(outline_, split_, config_.outline_sash());
+
+    pdf_view_ = new PdfView(content_, pdf_settings_);
+    // An "(ann)" copy is a new file the tree has not seen.
+    pdf_view_->set_on_files_changed([this] { files_->refresh(); });
+    content_->AddPage(outline_split_, "Markdown");
+    content_->AddPage(pdf_view_, "PDF");
+    content_->SetSelection(kMarkdownPage);
+
+    favorites_split_->SplitHorizontally(favorites_, files_,
+                                        config_.favorites_sash());
+    recent_split_->SplitHorizontally(recent_, favorites_split_,
+                                     config_.recent_sash());
+    files_split_->SplitVertically(recent_split_, content_,
+                                  config_.files_sash());
+
+    // The Find bar is a second row of the frame's own sizer, below every
+    // pane and hidden until Ctrl+F.  Putting it inside the editor's pane
+    // would have meant wrapping the editor in a panel, and the editor is
+    // Unsplit() by pointer in three places -- see FindBar.h.
+    find_bar_ = new FindBar(this);
+    find_bar_->Hide();
+    find_bar_->set_on_find([this](const FindRequest& request) {
+        find_in_document(request);
+    });
+    // Closing the bar puts the caret back where the user was working; without
+    // it focus is left on a hidden window and the next keystroke goes nowhere
+    // anyone can see.
+    find_bar_->set_on_close([this] { editor_->SetFocus(); });
+
+    // The top-level child goes in a sizer: wxFrame will stretch a lone child
+    // to fill, but that fallback does not drive a proper layout pass.
+    auto* sizer = new wxBoxSizer(wxVERTICAL);
+    sizer->Add(files_split_, 1, wxEXPAND);
+    sizer->Add(find_bar_, 0, wxEXPAND);
+    SetSizer(sizer);
+    Layout();
+
+    // A drop is consumed by whichever child window is under the cursor, so
+    // every pane the user might aim at needs its own target.  Each
+    // SetDropTarget takes ownership, hence a fresh instance per window.
+    const auto open_dropped = [this](const std::string& path) {
+        open_path(path);
+    };
+    for (wxWindow* target : {static_cast<wxWindow*>(this),
+                             static_cast<wxWindow*>(editor_),
+                             static_cast<wxWindow*>(preview_),
+                             static_cast<wxWindow*>(files_),
+                             static_cast<wxWindow*>(outline_),
+                             static_cast<wxWindow*>(recent_),
+                             static_cast<wxWindow*>(favorites_),
+                             static_cast<wxWindow*>(pdf_view_)}) {
+        target->SetDropTarget(new DocumentDropTarget(open_dropped));
+    }
+
+    files_->set_roots(config_.roots());
+    // Reopen the folders that were open last time.  The tree holds the set
+    // until its scan has produced rows to expand, so handing it over here --
+    // before anything has been scanned -- is the intended order.
+    files_->set_expanded_folders(config_.expanded_folders());
+    refresh_lists();
+
+    // Re-apply hidden columns from last time.  The sash positions are already
+    // loaded, so a pane shown again returns to the width it had.
+    hidden_files_sash_ = config_.files_sash();
+    hidden_outline_sash_ = config_.outline_sash();
+    hidden_editor_sash_ = config_.editor_sash();
+    if (!config_.show_files()) {
+        files_split_->Unsplit(recent_split_);
+    }
+    if (!config_.show_outline()) {
+        outline_split_->Unsplit(outline_);
+    }
+    // Editor checked first, then preview: the two share one splitter and both
+    // cannot be hidden, so a profile claiming neither is showing resolves to
+    // "editor only" rather than to an empty pane.
+    if (!config_.show_editor()) {
+        split_->Unsplit(editor_);
+    } else if (!config_.show_preview()) {
+        split_->Unsplit(preview_);
+    }
+}
+
+WXLRESULT MainFrame::MSWWindowProc(WXUINT message, WXWPARAM wparam,
+                                   WXLPARAM lparam)
+{
+    if (message == WM_COPYDATA) {
+        const auto* data = reinterpret_cast<const COPYDATASTRUCT*>(lparam);
+        if (data != nullptr && data->dwData == instance_message_id() &&
+            data->lpData != nullptr && data->cbData > 1) {
+            // The sender is blocked in SendMessage, so copy the payload out
+            // before doing anything that could pump messages.
+            const std::string path(static_cast<const char*>(data->lpData),
+                                   data->cbData - 1);
+            Raise();
+            CallAfter([this, path] { open_path(path); });
+            return TRUE;
+        }
+    }
+    return wxFrame::MSWWindowProc(message, wparam, lparam);
+}
+
+void MainFrame::refresh_lists()
+{
+    recent_->set_paths(config_.recents());
+    favorites_->set_paths(config_.favorites());
+}
+
+void MainFrame::bind_events()
+{
+    Bind(wxEVT_MENU, &MainFrame::on_open, this, wxID_OPEN);
+    Bind(wxEVT_MENU, &MainFrame::on_save, this, wxID_SAVE);
+    Bind(wxEVT_MENU, &MainFrame::on_exit, this, wxID_EXIT);
+    Bind(wxEVT_MENU, &MainFrame::on_toggle_front_matter, this,
+         kIdToggleFrontMatter);
+    Bind(wxEVT_MENU, &MainFrame::on_manage_folders, this, kIdManageFolders);
+    Bind(wxEVT_MENU, &MainFrame::on_toggle_favorite, this, kIdToggleFavorite);
+    Bind(wxEVT_MENU, &MainFrame::on_new, this, wxID_NEW);
+    Bind(wxEVT_MENU, &MainFrame::on_new_from_template, this,
+         kIdNewFromTemplate);
+    Bind(wxEVT_MENU, &MainFrame::on_close_document, this, kIdCloseDocument);
+    Bind(wxEVT_MENU, &MainFrame::on_snippet, this, kIdSnippetBase,
+         kIdSnippetBase + static_cast<int>(std::size(kSnippets)) - 1);
+    Bind(wxEVT_MENU, &MainFrame::on_insert_image, this, kIdInsertImage);
+    Bind(wxEVT_MENU, &MainFrame::on_open_templates_folder, this,
+         kIdOpenTemplates);
+    Bind(wxEVT_MENU, &MainFrame::on_add_login, this, kIdAddLogin);
+    Bind(wxEVT_MENU, &MainFrame::on_add_todo, this, kIdAddTodo);
+    Bind(wxEVT_MENU, &MainFrame::on_add_diary, this, kIdAddDiary);
+    Bind(wxEVT_MENU, &MainFrame::on_add_fact, this, kIdAddFact);
+    Bind(wxEVT_MENU, &MainFrame::on_open_internal_folder, this,
+         kIdOpenInternal);
+    Bind(wxEVT_MENU, &MainFrame::on_tech_notes, this, kIdTechNotes);
+    Bind(wxEVT_MENU, &MainFrame::on_refresh_tech_notes, this,
+         kIdRefreshTechNotes);
+    Bind(wxEVT_MENU, &MainFrame::on_find, this, kIdFind);
+    Bind(wxEVT_MENU, &MainFrame::on_find_next, this, kIdFindNext);
+    Bind(wxEVT_MENU, &MainFrame::on_find_previous, this, kIdFindPrevious);
+    Bind(wxEVT_MENU, &MainFrame::on_find_in_files, this, kIdFindInFiles);
+    Bind(wxEVT_MENU, &MainFrame::on_back, this, kIdBack);
+    Bind(wxEVT_MENU, &MainFrame::on_forward, this, kIdForward);
+    Bind(wxEVT_MENU, &MainFrame::on_promote_document, this, kIdPromoteDocument);
+    Bind(wxEVT_MENU, &MainFrame::on_export_pdf, this, kIdExportPdf);
+    Bind(wxEVT_MENU, &MainFrame::on_publish, this, kIdPublish);
+    Bind(wxEVT_MENU, &MainFrame::on_open_published, this, kIdOpenPublished);
+    Bind(wxEVT_MENU, [this](wxCommandEvent&) {
+        if (showing_pdf_) {
+            pdf_view_->bookmark_current_page();
+        }
+    }, kIdBookmarkPage);
+    Bind(wxEVT_MENU, &MainFrame::on_preview_theme, this, kIdThemeGitHub);
+    Bind(wxEVT_MENU, &MainFrame::on_preview_theme, this, kIdThemeNotes);
+    Bind(wxEVT_MENU, &MainFrame::on_refresh, this, kIdRefresh);
+    Bind(wxEVT_MENU, &MainFrame::on_toggle_files, this, kIdToggleFiles);
+    Bind(wxEVT_MENU, &MainFrame::on_toggle_outline, this, kIdToggleOutline);
+    Bind(wxEVT_MENU, &MainFrame::on_toggle_editor, this, kIdToggleEditor);
+    Bind(wxEVT_MENU, &MainFrame::on_toggle_preview, this, kIdTogglePreview);
+    Bind(wxEVT_MENU, &MainFrame::on_file_types, this, kIdFileTypes);
+    Bind(wxEVT_MENU, &MainFrame::on_help, this, kIdHelp);
+    Bind(wxEVT_MENU, &MainFrame::on_about, this, wxID_ABOUT);
+    Bind(wxEVT_MENU, &MainFrame::on_check_updates, this, kIdCheckUpdates);
+    Bind(wxEVT_CLOSE_WINDOW, &MainFrame::on_close, this);
+    Bind(wxEVT_TIMER, &MainFrame::on_render_timer, this, kIdRenderTimer);
+    Bind(wxEVT_TIMER, &MainFrame::on_scroll_echo_timer, this,
+         kIdScrollEchoTimer);
+    Bind(wxEVT_TIMER, &MainFrame::on_publish_timer, this, kIdPublishTimer);
+
+    editor_->Bind(wxEVT_STC_CHANGE, &MainFrame::on_text_changed, this);
+    editor_->Bind(wxEVT_STC_UPDATEUI, &MainFrame::on_editor_scrolled, this);
+}
+
+bool MainFrame::open_path(const std::string& path, OpenMode mode)
+{
+    assert(!path.empty() && "open_path needs a path");
+    // Everything opens through here -- the tree, recents, favorites, a drop,
+    // a link, Back -- so this is the one place the two kinds of file part.
+    if (is_pdf(path_to_utf8(path_from_utf8(path).filename()))) {
+        return open_pdf(path, mode);
+    }
+    const bool browsing = mode == OpenMode::kBrowse;
+    // Already showing it: arrowing back onto the current row must not re-read
+    // the file and re-render, and must not throw away where you had scrolled.
+    if (browsing && !showing_pdf_ &&
+        norm_path(path) == norm_path(current_path_)) {
+        return true;
+    }
+    if (!leave_pdf(mode)) {
+        return false;
+    }
+    // Unsaved work is never put to the user one keystroke at a time.  Browsing
+    // simply stops while the document is dirty; Enter still asks properly.
+    if (browsing && dirty_) {
+        return false;
+    }
+    if (!browsing && !confirm_discard()) {
+        return false;
+    }
+    bool ok = false;
+    std::string text = read_text_file(path, ok);
+    if (!ok) {
+        if (browsing) {
+            return false;   // a file that vanished is not worth a dialog here
+        }
+        wxMessageBox("Could not read:\n" + wxString::FromUTF8(path),
+                     "DocBoss", wxOK | wxICON_ERROR, this);
+        return false;
+    }
+
+    // Divergence from the Python app, which fails a non-UTF-8 file with a
+    // decode error: the port offers to convert a recognisable legacy
+    // encoding.  What it must never do is what shipped in v1.2.0 -- strict
+    // FromUTF8 turning an undecodable file into an EMPTY editor, from which
+    // one Ctrl+S wiped the document.
+    bool needs_conversion = false;
+    if (first_invalid_utf8(text) != std::string::npos) {
+        if (browsing) {
+            // Converting is a decision, and a decision needs a prompt, which
+            // browsing may not raise.  Left for Enter.
+            return false;
+        }
+        const TextEncoding kind = detect_text_encoding(text);
+        bool converted = false;
+        std::string utf8;
+        if (kind != TextEncoding::kBinary) {
+            utf8 = convert_to_utf8(text, kind, converted);
+        }
+        if (!converted) {
+            wxMessageBox(
+                wxString::FromUTF8(
+                    "Not opened: the file is not valid UTF-8 (first bad "
+                    "byte at offset " +
+                    std::to_string(first_invalid_utf8(text)) +
+                    ") and no safe conversion exists.\n\n" + path),
+                "DocBoss", wxOK | wxICON_ERROR, this);
+            return false;
+        }
+        const int answer = wxMessageBox(
+            wxString::FromUTF8("This file is encoded as " +
+                               text_encoding_name(kind) +
+                               ", not UTF-8:\n\n" + path +
+                               "\n\nConvert it and open?  The file on disk "
+                               "stays untouched until you save; saving "
+                               "writes UTF-8."),
+            "DocBoss", wxYES_NO | wxICON_QUESTION, this);
+        if (answer != wxYES) {
+            return false;
+        }
+        text = utf8;
+        needs_conversion = true;
+    }
+
+    editor_->SetText(wxString::FromUTF8(text));
+    editor_->EmptyUndoBuffer();
+    current_path_ = path;
+    // A converted document differs from the bytes on disk until it is
+    // saved, and the dirty flag is what makes that visible.
+    dirty_ = needs_conversion;
+    watcher_.watch(current_path_);
+    // Any warning on show belonged to the document being replaced.
+    SetStatusText(wxString());
+    // History records everything actually SHOWN, browsing included: after
+    // arrowing through a folder, Back meaning "the one I was just looking at"
+    // is the only reading that matches what happened on screen.  Recents are
+    // a different question -- what you chose -- which is why the two diverge
+    // here rather than sharing a list.
+    push_history(path);
+    // Recents are the documents you chose, not the ones you scrolled past.
+    // Recording a browse would also mean a config.json write per keystroke.
+    if (!browsing) {
+        config_.push_recent(path);
+        config_.save();
+        refresh_lists();
+    }
+    update_title();
+    render_preview();
+    return true;
+}
+
+void MainFrame::push_history(const std::string& path)
+{
+    assert(!path.empty() && "history needs a path");
+    assert((history_.empty() || history_pos_ < history_.size()) &&
+           "the cursor must point inside the history");
+    // A move made BY Back or Forward must not record itself, or the pair would
+    // shuffle two documents for ever instead of walking the list.
+    if (navigating_) {
+        return;
+    }
+    // Re-opening the document already on screen is not a move: a refresh, a
+    // save, or a reload after an outside edit all come back through here.
+    if (!history_.empty() &&
+        norm_path(history_[history_pos_]) == norm_path(path)) {
+        return;
+    }
+    // Opening something new abandons the forward trail, exactly as a browser
+    // does: the documents you had gone Back past are no longer ahead of you.
+    if (!history_.empty()) {
+        history_.erase(history_.begin() +
+                           static_cast<std::ptrdiff_t>(history_pos_) + 1,
+                       history_.end());
+    }
+    history_.push_back(path);
+    if (history_.size() > kMaxHistory) {
+        history_.erase(history_.begin());
+    }
+    history_pos_ = history_.size() - 1;
+    update_nav_state();
+}
+
+void MainFrame::update_nav_state()
+{
+    // The cursor is where you ARE, so Back needs something before it and
+    // Forward something after it.
+    wxToolBar* bar = GetToolBar();
+    if (bar == nullptr) {
+        return;
+    }
+    assert((history_.empty() || history_pos_ < history_.size()) &&
+           "the cursor must point inside the history");
+    bar->EnableTool(kIdBack, history_pos_ > 0);
+    bar->EnableTool(kIdForward, history_pos_ + 1 < history_.size());
+}
+
+void MainFrame::navigate_history(int step)
+{
+    assert((step == -1 || step == 1) &&
+           "history moves one document at a time, in one direction");
+    assert((history_.empty() || history_pos_ < history_.size()) &&
+           "the cursor must point inside the history");
+
+    // Keep going until something opens.  A document may have been deleted,
+    // moved or renamed since it was visited, and stopping dead on the first
+    // one that has gone would make Back useless for the rest of the session.
+    // Bounded (Rule 2): every pass either returns or removes an entry.
+    for (std::size_t guard = 0; guard <= kMaxHistory; ++guard) {
+        const std::ptrdiff_t next =
+            static_cast<std::ptrdiff_t>(history_pos_) + step;
+        if (next < 0 ||
+            next >= static_cast<std::ptrdiff_t>(history_.size())) {
+            break;   // nothing that way
+        }
+        const std::size_t target_index = static_cast<std::size_t>(next);
+        const std::string target = history_[target_index];
+
+        // Nothing is moved or removed until the open has actually succeeded,
+        // so a failed attempt leaves the history exactly as it was.
+        navigating_ = true;
+        const bool opened = open_path(target);
+        navigating_ = false;
+
+        if (opened) {
+            history_pos_ = target_index;
+            update_nav_state();
+            return;
+        }
+        // With unsaved work outstanding the likeliest reason is that the user
+        // declined to discard it.  That is an answer, not an obstacle.
+        if (dirty_) {
+            break;
+        }
+        // Unreachable.  Drop THAT entry -- never the current one -- and try
+        // the next in the same direction.  Removing an entry before the
+        // cursor shifts the cursor down with it.
+        history_.erase(history_.begin() +
+                       static_cast<std::ptrdiff_t>(target_index));
+        if (target_index < history_pos_) {
+            --history_pos_;
+        }
+    }
+    update_nav_state();
+}
+
+void MainFrame::on_back(wxCommandEvent&)
+{
+    navigate_history(-1);
+}
+
+void MainFrame::on_forward(wxCommandEvent&)
+{
+    navigate_history(1);
+}
+
+// ---------------------------------------------------------- searching --
+
+void MainFrame::on_find(wxCommandEvent&)
+{
+    // A PDF has its own search box, in the viewer, which knows about pages
+    // and draws its hits; Ctrl+F goes there.
+    if (showing_pdf_) {
+        pdf_view_->focus_search();
+        return;
+    }
+    // A selection seeds the query, as every editor does -- but only a
+    // single-line one: selecting three paragraphs and pressing Ctrl+F means
+    // "search within these", not "search for all of this".
+    wxString seed;
+    if (editor_ != nullptr && editor_->GetSelectionEnd() >
+                                  editor_->GetSelectionStart()) {
+        const wxString selected = editor_->GetSelectedText();
+        if (selected.find('\n') == wxString::npos &&
+            selected.length() <= kMaxFindSeed) {
+            seed = selected;
+        }
+    }
+    // Where an incremental search starts from, taken now: typing must not
+    // walk forward through the document a keystroke at a time, and deleting
+    // a character has to come back to the same place.
+    find_origin_ = editor_selection_start();
+    find_bar_->open(seed);
+}
+
+void MainFrame::on_find_next(wxCommandEvent& event)
+{
+    step_find(1, event);
+}
+
+void MainFrame::on_find_previous(wxCommandEvent& event)
+{
+    step_find(-1, event);
+}
+
+void MainFrame::step_find(int direction, wxCommandEvent& event)
+{
+    if (showing_pdf_) {
+        if (direction >= 0) {
+            pdf_view_->find_next();
+        } else {
+            pdf_view_->find_previous();
+        }
+        return;
+    }
+    // F3 with nothing to repeat is a request to search, not a no-op: there is
+    // no previous query to step through, so the bar opens instead.
+    if (!find_bar_->IsShown() || find_bar_->needle().empty()) {
+        on_find(event);
+        return;
+    }
+    FindRequest request;
+    request.needle = find_bar_->needle();
+    request.options = find_bar_->options();
+    request.direction = direction;
+    find_in_document(request);
+}
+
+std::size_t MainFrame::editor_selection_start() const
+{
+    const int start = editor_->GetSelectionStart();
+    return (start > 0) ? static_cast<std::size_t>(start) : 0;
+}
+
+void MainFrame::find_in_document(const FindRequest& request)
+{
+    if (request.needle.empty()) {
+        return;
+    }
+    // Scintilla positions are byte offsets into the UTF-8 document, which is
+    // exactly what TextSearch deals in, so a match found here can be selected
+    // without a conversion that could land a character out.
+    const std::string text = editor_->GetText().utf8_string();
+
+    std::size_t from = find_origin_;
+    if (!request.incremental) {
+        // Forward from the end of the current match, back from its start, so
+        // repeating never finds the same one twice.
+        const int end = editor_->GetSelectionEnd();
+        from = (request.direction >= 0)
+                   ? ((end > 0) ? static_cast<std::size_t>(end) : 0)
+                   : editor_selection_start();
+    }
+    const TextMatch match =
+        (request.direction >= 0)
+            ? find_next(text, request.needle, from, request.options)
+            : find_previous(text, request.needle, from, request.options);
+    if (!match.found()) {
+        find_bar_->set_status(L"No matches");
+        return;
+    }
+    editor_->SetSelection(static_cast<int>(match.offset),
+                          static_cast<int>(match.offset + match.length));
+    editor_->EnsureCaretVisible();
+
+    // "3 of 12" rather than a bare "found": the count is what tells you
+    // whether stepping through is worth the trouble.  Bounded, and the bound
+    // is shown when it is reached rather than presented as a total.
+    const std::vector<LineHit> hits =
+        hits_in_text(text, request.needle, request.options, kMaxFindHits);
+    std::size_t index = 0;
+    for (std::size_t i = 0; i < hits.size(); ++i) {   // bounded by kMaxFindHits
+        if (hits[i].offset == match.offset) {
+            index = i + 1;
+            break;
+        }
+    }
+    wxString status;
+    if (index > 0) {
+        status = wxString::Format(L"%ld of %ld", static_cast<long>(index),
+                                  static_cast<long>(hits.size()));
+        if (hits.size() >= kMaxFindHits) {
+            status += L"+";
+        }
+    } else {
+        status = L"Found";
+    }
+    if (match.wrapped) {
+        status += L" (wrapped)";
+    }
+    find_bar_->set_status(status);
+}
+
+void MainFrame::on_find_in_files(wxCommandEvent&)
+{
+    if (find_in_files_ == nullptr) {
+        // Built on first use and kept: closing it hides it, so a result list
+        // survives going away to read one of the documents in it.
+        find_in_files_ = new FindInFilesDialog(this);
+        find_in_files_->set_documents(
+            [this] { return files_->document_paths(); });
+        find_in_files_->set_on_open_match(
+            [this](const DocumentMatch& match, const std::string& needle,
+                   const SearchOptions& options) {
+                open_match(match, needle, options);
+            });
+    }
+    wxString seed;
+    if (editor_ != nullptr && editor_->GetSelectionEnd() >
+                                  editor_->GetSelectionStart()) {
+        const wxString selected = editor_->GetSelectedText();
+        if (selected.length() <= kMaxFindSeed) {
+            // Newlines and all: this is the command for a block of text, and
+            // a selected block is the likeliest thing to be looking for.
+            seed = selected;
+        }
+    }
+    find_in_files_->open(seed);
+}
+
+void MainFrame::open_match(const DocumentMatch& match,
+                           const std::string& needle,
+                           const SearchOptions& options)
+{
+    if (!open_path(match.path)) {
+        return;   // open_path has already said why
+    }
+    const std::string text = editor_->GetText().utf8_string();
+    std::size_t offset = match.offset;
+    std::size_t length = match_length_at(text, needle, offset, options);
+    if (length == 0) {
+        // The file may have been edited between the search and the click, so
+        // the recorded offset is a hint rather than a fact.  Finding the text
+        // again beats selecting whatever now sits at that byte.
+        const TextMatch again = find_forward(text, needle, 0, options);
+        if (!again.found()) {
+            editor_->GotoLine(match.line - 1);
+            editor_->SetFocus();
+            return;
+        }
+        offset = again.offset;
+        length = again.length;
+    }
+    editor_->SetSelection(static_cast<int>(offset),
+                          static_cast<int>(offset + length));
+    editor_->EnsureCaretVisible();
+    editor_->SetFocus();
+}
+
+void MainFrame::on_open(wxCommandEvent&)
+{
+    wxFileDialog dialog(this, L"Open a document or PDF", "", "",
+                        kOpenAnyWildcard, wxFD_OPEN | wxFD_FILE_MUST_EXIST);
+    if (dialog.ShowModal() != wxID_OK) {
+        return;
+    }
+    open_path(std::string(dialog.GetPath().ToUTF8()));
+}
+
+void MainFrame::on_save(wxCommandEvent&)
+{
+    // Never while a PDF is showing: the editor is empty then, and there is
+    // nothing of the user's in it to write anywhere.  A PDF's highlights are
+    // saved through the viewer's own prompt.
+    if (showing_pdf_) {
+        pdf_view_->maybe_save_annotations();
+        update_title();
+        return;
+    }
+    if (current_path_.empty()) {
+        // A document that has never been saved has no name to offer, but it
+        // usually has a title -- typed into the New-from-template prompt, or
+        // written as the first heading.  Offering it beats an empty box and
+        // costs nothing when it is wrong: the dialog is still a dialog.
+        const wxString suggested = wxString::FromUTF8(filename_from_title(
+            mdrender::document_title(editor_->GetText().utf8_string())));
+        wxFileDialog dialog(this, L"Save Markdown file", "", suggested,
+                            kOpenWildcard,
+                            wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
+        if (dialog.ShowModal() != wxID_OK) {
+            return;
+        }
+        current_path_ = std::string(dialog.GetPath().ToUTF8());
+    }
+    if (save_to(current_path_)) {
+        dirty_ = false;
+        // After the write, so the state adopted as "expected" is the one we
+        // just produced.  Our own save raises the same event an outside edit
+        // does; this is what stops it being reported back to us.
+        watcher_.watch(current_path_);
+        // A "your unsaved edits are kept" warning is about a conflict this
+        // save has just resolved; leaving it up would keep warning about
+        // edits that are now on disk.
+        SetStatusText(wxString());
+        update_title();
+    }
+}
+
+bool MainFrame::save_to(const std::string& path)
+{
+    assert(!path.empty() && "save_to needs a path");
+    // utf8_string(): one owned deep copy, no scoped-buffer aliasing.  The
+    // checked write exists because v1.2.0 saved documents whose first 16
+    // bytes the heap had already reclaimed -- six files lost their heads to
+    // freed-block pointers.  Validating the buffer and reading the file back
+    // turns that silent corruption into a refused save.
+    std::string text = editor_->GetText().utf8_string();
+    // A document started from the TechNote template carries the logo inline so
+    // it renders while it is still unsaved and has no folder.  It has one now,
+    // so put the .png beside it and swap in the relative reference every
+    // hand-written tech note uses.  Silently a no-op for any other document.
+    if (has_embedded_logo(text)) {
+        const std::string localized = localize_embedded_logo(text, path);
+        if (localized != text) {
+            text = localized;
+            // Keep the editor and the file in step: leaving the buffer holding
+            // a data: URI the file no longer has would make the next save
+            // re-do this, and the document watcher report our own write as an
+            // outside edit.  The caret is clamped rather than tracked -- this
+            // happens once, on the first save of a brand-new note.
+            const int caret = editor_->GetCurrentPos();
+            const int top = editor_->GetFirstVisibleLine();
+            editor_->SetText(wxString::FromUTF8(text));
+            editor_->GotoPos(std::min(caret, editor_->GetLength()));
+            editor_->SetFirstVisibleLine(top);
+        }
+    }
+    // Whether this path is one the tree already knows has to be asked BEFORE
+    // the write, since afterwards the file exists either way.
+    const bool is_new = !files_->knows_document(path);
+
+    const std::string error = write_text_file_checked(path, text);
+    if (!error.empty()) {
+        wxMessageBox(wxString::FromUTF8(error) + "\n\n" +
+                         wxString::FromUTF8(path),
+                     "DocBoss", wxOK | wxICON_ERROR, this);
+        return false;
+    }
+    // A document saved somewhere new is missing from the tree, from the folder
+    // counts, and from everything built off the scan -- which is how a tech
+    // note created and saved could be absent from the index rebuilt seconds
+    // later.  Only for a new path: re-saving an open document changes nothing
+    // the scan reports, and rescanning every root on every Ctrl+S would be a
+    // real cost for no answer.
+    if (is_new) {
+        files_->refresh();
+    }
+    return true;
+}
+
+void MainFrame::on_export_favorites()
+{
+    const std::vector<std::string>& favorites = config_.favorites();
+    if (favorites.empty()) {
+        wxMessageBox("You have no favorites to export.", "DocBoss",
+                     wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+
+    wxFileDialog dialog(this, "Export favorites", "", "mdboss-favorites.json",
+                        "JSON files (*.json)|*.json",
+                        wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
+    if (dialog.ShowModal() != wxID_OK) {
+        return;
+    }
+
+    const std::string target = std::string(dialog.GetPath().ToUTF8());
+    std::ofstream stream(path_from_utf8(target),
+                         std::ios::binary | std::ios::trunc);
+    const std::string text = favorites_to_json(favorites);
+    if (stream) {
+        stream.write(text.data(), static_cast<std::streamsize>(text.size()));
+    }
+    if (!stream || !stream.good()) {
+        wxMessageBox("Could not write file:\n" + dialog.GetPath(), "DocBoss",
+                     wxOK | wxICON_WARNING, this);
+        return;
+    }
+
+    wxMessageBox(wxString::Format("Exported %zu favorite(s) to:\n",
+                                  favorites.size()) +
+                     dialog.GetPath(),
+                 "DocBoss", wxOK | wxICON_INFORMATION, this);
+}
+
+void MainFrame::on_import_favorites()
+{
+    wxFileDialog dialog(this, "Import favorites", "", "",
+                        "JSON files (*.json)|*.json|All files (*.*)|*.*",
+                        wxFD_OPEN | wxFD_FILE_MUST_EXIST);
+    if (dialog.ShowModal() != wxID_OK) {
+        return;
+    }
+
+    bool ok = false;
+    const std::string text =
+        read_text_file(std::string(dialog.GetPath().ToUTF8()), ok);
+    if (!ok) {
+        wxMessageBox("Could not read file:\n" + dialog.GetPath(), "DocBoss",
+                     wxOK | wxICON_WARNING, this);
+        return;
+    }
+
+    const FavoritesFile file = parse_favorites_json(text);
+    if (!file.parsed) {
+        wxMessageBox("That file doesn't contain a favorites list.", "DocBoss",
+                     wxOK | wxICON_WARNING, this);
+        return;
+    }
+    if (file.paths.empty()) {
+        wxMessageBox("No favorites were found in that file.", "DocBoss",
+                     wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+
+    // Only worth asking when there is something to lose.
+    bool merge = true;
+    if (!config_.favorites().empty()) {
+        const int answer = wxMessageBox(
+            L"Merge with your current favorites?\n\n"
+            L"Yes — add the imported files to your list\n"
+            L"No — replace your current favorites",
+            "DocBoss", wxYES_NO | wxCANCEL | wxICON_QUESTION, this);
+        if (answer == wxCANCEL) {
+            return;
+        }
+        merge = answer == wxYES;
+    }
+
+    config_.set_favorites(merge_favorites(config_.favorites(), file.paths,
+                                          merge, kMaxFavorites));
+    config_.save();
+    refresh_lists();
+    wxMessageBox(wxString::Format("Your favorites list now has %zu item(s).",
+                                  config_.favorites().size()),
+                 "DocBoss", wxOK | wxICON_INFORMATION, this);
+}
+
+void MainFrame::on_import_to_inbox()
+{
+    const std::string inbox = find_inbox(root_paths());
+    if (inbox.empty()) {
+        wxMessageBox(wxString(L"No ") + kInboxName + L" folder was found.\n\n"
+                         L"Create a folder named " + kInboxName +
+                         L" inside one of your root folders (or add one as a "
+                         L"root), then try again.",
+                     "DocBoss", wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+
+    wxFileDialog dialog(this, wxString(L"Import files into ") + kInboxName, "",
+                        "", kOpenWildcard,
+                        wxFD_OPEN | wxFD_MULTIPLE | wxFD_FILE_MUST_EXIST);
+    if (dialog.ShowModal() != wxID_OK) {
+        return;
+    }
+    wxArrayString chosen;
+    dialog.GetPaths(chosen);
+
+    std::vector<std::string> copied;
+    std::vector<std::string> failed;
+    const std::size_t limit = std::min<std::size_t>(chosen.GetCount(), 1000);
+    for (std::size_t i = 0; i < limit; ++i) {   // bounded (Rule of 10)
+        const std::string src = std::string(chosen[i].ToUTF8());
+        std::error_code ec;
+        if (!std::filesystem::is_regular_file(path_from_utf8(src), ec) || ec) {
+            continue;
+        }
+        // Already in the inbox: open it where it is rather than making a
+        // second copy of a file the user can already see there.
+        if (norm_path(path_to_utf8(path_from_utf8(src).parent_path())) ==
+            norm_path(inbox)) {
+            copied.push_back(src);
+            continue;
+        }
+        const std::string dest =
+            unique_dest(inbox, path_to_utf8(path_from_utf8(src).filename()));
+        std::filesystem::copy_file(path_from_utf8(src), path_from_utf8(dest),
+                                   ec);
+        if (ec) {
+            failed.push_back(src);
+            continue;
+        }
+        copied.push_back(dest);
+    }
+
+    files_->refresh();
+    if (!failed.empty()) {
+        wxString names;
+        for (const std::string& path : failed) {
+            names += "\n" + wxString::FromUTF8(
+                                path_to_utf8(path_from_utf8(path).filename()));
+        }
+        wxMessageBox(wxString(L"Could not copy these files into ") +
+                         kInboxName + ":" + names,
+                     "DocBoss", wxOK | wxICON_WARNING, this);
+    }
+    if (!copied.empty()) {
+        open_path(copied.front());
+    }
+}
+
+void MainFrame::on_document_changed(const std::string& path, bool still_exists)
+{
+    // The watch may outlive the document by a moment: a change reported for a
+    // file we have since navigated away from is not ours to act on.
+    if (path != current_path_) {
+        return;
+    }
+
+    if (!still_exists) {
+        // Emphatically not a reload -- there is nothing left to read.  The
+        // buffer is now the only copy, so it is left exactly as it is.
+        SetStatusText(L"Deleted or renamed on disk. The copy open here is "
+                      L"now the only one — save it to write it back.");
+        return;
+    }
+
+    if (dirty_) {
+        SetStatusText(L"Changed on disk. Your unsaved edits are kept — "
+                      L"save to overwrite the file, or reopen to discard.");
+        return;
+    }
+
+    reload_from_disk();
+}
+
+void MainFrame::reload_from_disk()
+{
+    assert(!current_path_.empty() && "reload needs an open document");
+    assert(!dirty_ && "reload must never discard unsaved edits");
+
+    bool ok = false;
+    const std::string text = read_text_file(current_path_, ok);
+    if (!ok) {
+        // Readable a moment ago, not now: mid-write, or locked by whatever is
+        // writing it.  Leave the buffer alone rather than blanking it.
+        SetStatusText(L"Changed on disk, but could not be read just now.");
+        return;
+    }
+    if (first_invalid_utf8(text) != std::string::npos) {
+        // Whatever wrote the file damaged it; strict FromUTF8 would turn it
+        // into an empty buffer.  Keep the good text we already have.
+        SetStatusText(L"Changed on disk, but is no longer valid UTF-8 — "
+                      L"not reloaded.");
+        return;
+    }
+
+    // Keep the reader where they were.  Both are clamped because the file may
+    // have shrunk since, and Scintilla is happy to be told about a line that
+    // no longer exists.
+    const int first_visible = editor_->GetFirstVisibleLine();
+    const int caret = editor_->GetCurrentPos();
+
+    editor_->SetText(wxString::FromUTF8(text));
+    editor_->EmptyUndoBuffer();
+    editor_->GotoPos(std::min(caret, editor_->GetLength()));
+    editor_->ScrollToLine(std::min(first_visible,
+                                   std::max(0, editor_->GetLineCount() - 1)));
+
+    // SetText raises the change event, which set the dirty flag; the document
+    // now matches the file, so it is clean whatever that handler concluded.
+    dirty_ = false;
+    watcher_.accept_current_state();
+    update_title();
+    render_preview();
+    SetStatusText(L"Reloaded — the file changed on disk.");
+}
+
+void MainFrame::on_exit(wxCommandEvent&)
+{
+    Close(false);
+}
+
+void MainFrame::on_toggle_front_matter(wxCommandEvent& event)
+{
+    // Deliberately NOT event.IsChecked().  The View menu item and the toolbar
+    // button are two separate check controls sharing one id, and toggling one
+    // never updated the other -- so after a click on the toolbar the menu
+    // still showed the old state, and the next click from the menu reported a
+    // value that flipped the setting the wrong way.  Reading and inverting the
+    // stored setting makes the two agree by construction.
+    const bool hide = !config_.hide_front_matter();
+    config_.set_hide_front_matter(hide);
+    sync_front_matter_checks(hide);
+    // Written now rather than at exit.  A setting that only reaches disk on a
+    // clean shutdown is lost to any crash, kill or power cut, which reads
+    // exactly like "it does not remember what I chose".
+    config_.save();
+    render_preview();
+    event.Skip(false);
+}
+
+void MainFrame::sync_front_matter_checks(bool hide)
+{
+    if (wxMenuBar* menus = GetMenuBar()) {
+        menus->Check(kIdToggleFrontMatter, hide);
+    }
+    if (wxToolBar* bar = GetToolBar()) {
+        bar->ToggleTool(kIdToggleFrontMatter, hide);
+    }
+}
+
+void MainFrame::on_text_changed(wxStyledTextEvent& event)
+{
+    if (!dirty_) {
+        dirty_ = true;
+        update_title();
+    }
+    // Coalesce keystrokes: restart the timer rather than render each one.
+    render_timer_.Start(kRenderDebounceMs, wxTIMER_ONE_SHOT);
+    event.Skip();
+}
+
+void MainFrame::on_render_timer(wxTimerEvent&)
+{
+    render_preview();
+}
+
+void MainFrame::render_preview()
+{
+    assert(preview_ != nullptr && "preview must exist before rendering");
+    const std::string markdown = editor_->GetText().utf8_string();
+    const std::string base = current_path_.empty()
+                                 ? std::string("file:///")
+                                 : base_href_for(current_path_);
+    const std::string title =
+        current_path_.empty()
+            ? std::string("DocBoss")
+            : path_to_utf8(path_from_utf8(current_path_).filename());
+
+    preview_->show_page(mdrender::render_document(
+        markdown, base, title, config_.hide_front_matter(),
+        mdrender::theme_from_name(config_.preview_theme())));
+
+    // Same source, same strip_yaml, so the slugs here are the ids in the page
+    // that was just rendered.
+    outline_->set_headings(
+        mdrender::extract_outline(markdown, config_.hide_front_matter()));
+}
+
+void MainFrame::on_toggle_favorite(wxCommandEvent&)
+{
+    if (current_path_.empty()) {
+        return;   // nothing open; silently no-op rather than favourite ""
+    }
+    if (config_.is_favorite(current_path_)) {
+        config_.remove_favorite(current_path_);
+    } else {
+        config_.add_favorite(current_path_);
+    }
+    config_.save();
+    refresh_lists();
+}
+
+void MainFrame::on_new(wxCommandEvent&)
+{
+    if (!confirm_discard()) {
+        return;
+    }
+    clear_document();
+}
+
+void MainFrame::on_new_from_template(wxCommandEvent&)
+{
+    const std::vector<std::pair<std::string, std::string>> templates =
+        list_templates();
+    if (templates.empty()) {
+        const int answer = wxMessageBox(
+            "No templates yet.\n\nOpen the templates folder to add some?",
+            "DocBoss", wxYES_NO | wxICON_QUESTION, this);
+        if (answer == wxYES) {
+            wxCommandEvent unused;
+            on_open_templates_folder(unused);
+        }
+        return;
+    }
+
+    wxArrayString names;
+    for (const auto& [name, path] : templates) {
+        names.Add(wxString::FromUTF8(name));
+    }
+    const int choice = wxGetSingleChoiceIndex("Start from which template?",
+                                              "DocBoss", names, this);
+    if (choice < 0) {
+        return;
+    }
+    if (!confirm_discard()) {
+        return;
+    }
+
+    const wxString title = wxGetTextFromUser(
+        "Title for the new document:", "DocBoss", "Untitled", this);
+    if (title.IsEmpty()) {
+        return;
+    }
+
+    bool ok = false;
+    std::string body =
+        read_text_file(templates[static_cast<std::size_t>(choice)].second, ok);
+    if (!ok) {
+        wxMessageBox("Could not read that template.", "DocBoss",
+                     wxOK | wxICON_ERROR, this);
+        return;
+    }
+
+    // A tech note is numbered year.sequence, and the next sequence is DERIVED
+    // from the notes that exist -- the same rule as the index itself, and for
+    // the same reason: a counter kept in config would be one number in one
+    // profile that nothing could correct.  Guarded on the placeholder so that
+    // every other template stays free of this scan.
+    if (needs_tn_index(body)) {
+        SetStatusText(L"Numbering the new tech note…");
+        std::tm when{};
+        const std::time_t now = std::time(nullptr);
+        const bool have_year = localtime_s(&when, &now) == 0;
+        assert(have_year && "the clock must be readable to number a note");
+        if (have_year) {
+            std::vector<TechNote> existing =
+                scan_tech_notes(files_->document_paths());
+            // A number handed out in this session counts as taken even though
+            // the note holding it has not been saved yet -- the scan can only
+            // see files.  Without this, creating two notes and saving them
+            // afterwards gives both the same number, which is the easiest way
+            // to hit the one failure a numbered series has.
+            for (const std::string& issued : issued_tn_indices_) {
+                TechNote reserved;
+                reserved.tn_index = issued;
+                existing.push_back(reserved);
+            }
+            std::string assigned;
+            body = fill_tn_index(body, existing, when.tm_year + 1900, &assigned);
+            // Bounded: a session cannot reserve numbers without limit.
+            if (!assigned.empty() && issued_tn_indices_.size() < 1000) {
+                issued_tn_indices_.push_back(assigned);
+            }
+        }
+        SetStatusText(wxEmptyString);
+    }
+
+    editor_->SetText(wxString::FromUTF8(
+        apply_template(body, std::string(title.ToUTF8()))));
+    editor_->EmptyUndoBuffer();
+    // Deliberately unsaved and unnamed: the document exists only in the
+    // editor until the user chooses where it belongs.
+    current_path_.clear();
+    watcher_.watch(current_path_);
+    dirty_ = true;
+    update_title();
+    render_preview();
+}
+
+void MainFrame::seed_starter_templates()
+{
+    SeededTemplates seeded = config_.seeded_templates();
+    if (seed_templates(seeded)) {
+        // A starter this build added was offered just now.
+        config_.set_seeded_templates(seeded);
+        config_.save();
+    }
+}
+
+void MainFrame::on_open_templates_folder(wxCommandEvent&)
+{
+    seed_starter_templates();
+    const wxString dir = wxString::FromUTF8(templates_dir());
+    wxExecute("explorer.exe \"" + dir + "\"", wxEXEC_ASYNC);
+}
+
+// The three MD_Internal commands share this tail: write the block, tell the
+// user what went wrong if it did, and otherwise refresh so the new file (or
+// the folder itself, the first time) appears in the tree straight away.
+void MainFrame::save_internal_entry(const std::string& filename,
+                                    const std::string& seed,
+                                    const std::string& block,
+                                    const wxString& what)
+{
+    const std::string folder = internal_folder(root_paths());
+    const std::string failed =
+        append_to_internal(folder, filename, seed, block);
+    if (!failed.empty()) {
+        wxMessageBox(wxString::FromUTF8(failed), "DocBoss",
+                     wxOK | wxICON_ERROR, this);
+        return;
+    }
+    // A new entry changes a file the tree counts, and on first use creates the
+    // folder holding it, so the tree is out of date until this runs.
+    files_->refresh();
+    SetStatusText(what + wxString::FromUTF8(" saved to " + filename));
+}
+
+void MainFrame::on_add_login(wxCommandEvent&)
+{
+    LoginDialog dialog(this);
+    if (dialog.ShowModal() != wxID_OK) {
+        return;
+    }
+    const LoginRecord record = dialog.record();
+    if (record.name.empty() && record.login.empty()) {
+        // Both blank means the form was accepted by accident; a row of empty
+        // cells is worse than nothing because it still has to be deleted.
+        wxMessageBox(L"Give the record a name or a login before saving it.",
+                     "DocBoss", wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+    save_internal_entry(kLoginsFile, logins_seed(), login_table_row(record),
+                        L"Login record");
+}
+
+void MainFrame::on_add_todo(wxCommandEvent&)
+{
+    TodoDialog dialog(this);
+    if (dialog.ShowModal() != wxID_OK) {
+        return;
+    }
+    const std::string item = dialog.item();
+    if (item.find_first_not_of(" \t\r\n") == std::string::npos) {
+        return;   // nothing typed: silently do nothing rather than scold
+    }
+    save_internal_entry(kTodoFile, todo_seed(), todo_line(item, today_stamp()),
+                        L"To-do");
+}
+
+void MainFrame::on_add_diary(wxCommandEvent&)
+{
+    DiaryDialog dialog(this);
+    if (dialog.ShowModal() != wxID_OK) {
+        return;
+    }
+    const std::string body = dialog.markdown();
+    if (body.find_first_not_of(" \t\r\n") == std::string::npos) {
+        return;   // an empty entry is not an entry
+    }
+    save_internal_entry(kDiaryFile, diary_seed(),
+                        diary_entry(body, today_stamp()), L"Diary entry");
+}
+
+void MainFrame::on_add_fact(wxCommandEvent&)
+{
+    FactDialog dialog(this);
+    if (dialog.ShowModal() != wxID_OK) {
+        return;
+    }
+    const FactRecord record = dialog.record();
+    if (record.fact.find_first_not_of(" \t\r\n") == std::string::npos) {
+        // The date is prefilled, so an accepted-by-accident form would other-
+        // wise add a row that is nothing but a date -- still there, still to
+        // be deleted by hand.
+        wxMessageBox(L"Type the fact before saving it.", "DocBoss",
+                     wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+    save_internal_entry(kFactsFile, facts_seed(), fact_table_row(record),
+                        L"Fact");
+}
+
+void MainFrame::on_path_moved(const std::string& from, const std::string& to)
+{
+    // Favorites and recents hold ABSOLUTE paths, so a move that did not
+    // rewrite them would leave a favourite showing red and a recent that no
+    // longer opens -- with nothing on screen explaining why.
+    config_.replace_path(from, to);
+
+    // The open document.  Without this the frame keeps the old path and
+    // Ctrl+S writes the file back where it used to be, recreating it there
+    // and leaving two copies.
+    if (!current_path_.empty() &&
+        norm_path(current_path_) == norm_path(from)) {
+        current_path_ = to;
+        update_title();
+    }
+    config_.save();
+    refresh_lists();
+}
+
+void MainFrame::on_preview_theme(wxCommandEvent& event)
+{
+    const mdrender::Theme wanted = (event.GetId() == kIdThemeNotes)
+                                       ? mdrender::Theme::kNotes
+                                       : mdrender::Theme::kGitHub;
+    const std::string name = mdrender::theme_name(wanted);
+    if (name == config_.preview_theme()) {
+        return;   // radio items also fire when re-selecting the active one
+    }
+    config_.set_preview_theme(name);
+    config_.save();
+    // Re-render rather than reload: the Markdown has not changed, only the two
+    // stylesheets it is dressed in, and reloading would lose the scroll
+    // position and any unsaved edit.
+    render_preview();
+}
+
+void MainFrame::on_export_pdf(wxCommandEvent&)
+{
+    if (!preview_->ready()) {
+        wxMessageBox(L"The preview is still starting up. Try again in a "
+                     L"moment.",
+                     "DocBoss", wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+
+    // Named after the document, so exporting is one keystroke away from a
+    // sensible filename rather than a "Save as" hunt.  An untitled buffer has
+    // no name to borrow, so it falls back rather than proposing ".pdf".
+    wxString stem = "Untitled";
+    wxString folder;
+    if (!current_path_.empty()) {
+        const std::filesystem::path source = path_from_utf8(current_path_);
+        stem = wxString::FromUTF8(path_to_utf8(source.stem()));
+        folder = wxString::FromUTF8(path_to_utf8(source.parent_path()));
+    }
+
+    wxFileDialog dialog(this, L"Export as PDF", folder, stem + ".pdf",
+                        "PDF files (*.pdf)|*.pdf",
+                        wxFD_SAVE | wxFD_OVERWRITE_PROMPT);
+    if (dialog.ShowModal() != wxID_OK) {
+        return;
+    }
+    const std::string target = std::string(dialog.GetPath().ToUTF8());
+
+    SetStatusText(L"Exporting PDF…");
+    // The export is asynchronous, so the frame may be gone by the time it
+    // finishes.  A modal file dialog has just been dismissed, not a modal
+    // wait, so nothing is holding the window open.
+    preview_->export_pdf(target, [this, target](std::string failed) {
+        if (!failed.empty()) {
+            SetStatusText(wxEmptyString);
+            wxMessageBox(wxString::FromUTF8(failed), "DocBoss",
+                         wxOK | wxICON_ERROR, this);
+            return;
+        }
+        SetStatusText(wxString::FromUTF8("Exported " + target));
+    });
+}
+
+// ---------------------------------------------------------- publishing --
+
+void MainFrame::on_publish(wxCommandEvent&)
+{
+    if (showing_pdf_) {
+        SetStatusText(L"Publish works on a Markdown document — open one "
+                      L"first.");
+        return;
+    }
+    if (current_path_.empty()) {
+        wxMessageBox(L"Save the document first: a published PDF is written "
+                     L"beside its source, and this one has nowhere yet.",
+                     "DocBoss", wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+    publish_document(current_path_);
+}
+
+void MainFrame::publish_document(const std::string& md_path)
+{
+    assert(!md_path.empty() && "publish needs a document");
+    assert(is_markdown(path_to_utf8(path_from_utf8(md_path).filename())) &&
+           "only a Markdown document is published");
+    if (!pending_publish_.empty()) {
+        SetStatusText(L"Already publishing — one moment.");
+        return;
+    }
+    // Publishing renders through the preview, so the document has to be the
+    // open one.  From the tree's menu it may not be yet.
+    if (showing_pdf_ || norm_path(md_path) != norm_path(current_path_)) {
+        if (!open_path(md_path)) {
+            return;   // open_path has already said why
+        }
+    }
+    // The PDF must say what the file says.  Publishing unsaved edits would
+    // hand out a document that exists nowhere, and mark it current.
+    if (dirty_) {
+        wxMessageBox(L"Save the document first: a published PDF has to match "
+                     L"the file on disk.",
+                     "DocBoss", wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+    if (!preview_->ready()) {
+        wxMessageBox(L"The preview is still starting up. Try again in a "
+                     L"moment.",
+                     "DocBoss", wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+
+    // Render afresh and print once THAT page has loaded.  Printing whatever is
+    // on screen would publish a stale page whenever the render timer had not
+    // fired yet, or the document had only just been opened.
+    pending_publish_ = current_path_;
+    render_timer_.Stop();
+    SetStatusText(L"Publishing…");
+    // Fallback: if the load signal never comes, print what is there after a
+    // generous wait rather than leaving Publish stuck for the session.  The
+    // load handler restarts this with the short settle delay.
+    publish_timer_.Start(kPublishFallbackMs, wxTIMER_ONE_SHOT);
+    render_preview();
+}
+
+void MainFrame::on_page_loaded()
+{
+    if (pending_publish_.empty()) {
+        return;
+    }
+    // The page's scripts -- mermaid above all -- run on DOMContentLoaded and
+    // may still be drawing.  A short settle lets them finish.
+    publish_timer_.Start(kPublishSettleMs, wxTIMER_ONE_SHOT);
+}
+
+void MainFrame::on_publish_timer(wxTimerEvent&)
+{
+    const std::string source = pending_publish_;
+    pending_publish_.clear();
+    if (source.empty()) {
+        return;
+    }
+    // The user may have moved on, or typed, while the page loaded.
+    if (showing_pdf_ || dirty_ || norm_path(source) != norm_path(current_path_)) {
+        SetStatusText(L"Publish cancelled — the document changed.");
+        return;
+    }
+    const std::string target = published_pdf_path(source);
+    preview_->export_pdf(target, [this, target](std::string failed) {
+        if (!failed.empty()) {
+            SetStatusText(wxEmptyString);
+            wxMessageBox(wxString::FromUTF8(failed) + "\n\n" +
+                             wxString::FromUTF8(target),
+                         "DocBoss", wxOK | wxICON_ERROR, this);
+            return;
+        }
+        SetStatusText(wxString::FromUTF8(
+            "Published " + path_to_utf8(path_from_utf8(target).filename())));
+        // The marker beside the document changes, and a first publication
+        // turns up in the scan.
+        files_->refresh();
+    });
+}
+
+void MainFrame::on_open_published(wxCommandEvent&)
+{
+    if (showing_pdf_ || current_path_.empty()) {
+        return;
+    }
+    const std::string pdf = published_pdf_path(current_path_);
+    std::error_code ec;
+    if (!std::filesystem::exists(path_from_utf8(pdf), ec)) {
+        SetStatusText(L"This document has not been published yet "
+                      L"(Ctrl+Shift+P).");
+        return;
+    }
+    open_path(pdf);
+}
+
+bool MainFrame::open_pdf(const std::string& path, OpenMode mode)
+{
+    assert(!path.empty() && "open_pdf needs a path");
+    const bool browsing = mode == OpenMode::kBrowse;
+    if (showing_pdf_ && norm_path(path) == norm_path(pdf_view_->path())) {
+        return true;   // already on screen; keep the page and the zoom
+    }
+    // One file open at a time, so whatever is open goes -- after its unsaved
+    // work has been dealt with, and never by a prompt per arrow key.
+    const bool unsaved = dirty_ || (showing_pdf_ && pdf_view_->dirty());
+    if (browsing && unsaved) {
+        return false;
+    }
+    if (!browsing && !confirm_discard()) {
+        return false;
+    }
+    std::error_code ec;
+    if (!std::filesystem::is_regular_file(path_from_utf8(path), ec)) {
+        if (!browsing) {
+            wxMessageBox("Could not read:\n" + wxString::FromUTF8(path),
+                         "DocBoss", wxOK | wxICON_ERROR, this);
+        }
+        return false;
+    }
+
+    // The Markdown document is closed, not merely hidden: a hidden buffer
+    // would still be what Ctrl+S writes.
+    if (!showing_pdf_ && (!current_path_.empty() || editor_->GetLength() > 0)) {
+        clear_document();
+    }
+    const bool opened = pdf_view_->open(path);
+    showing_pdf_ = true;
+    content_->SetSelection(kPdfPage);
+    if (!opened) {
+        // The viewer says why on its own page; a browse leaves it at that.
+        update_title();
+        return false;
+    }
+    SetStatusText(wxString::FromUTF8(path));
+    push_history(path);
+    if (!browsing) {
+        config_.push_recent(path);
+        config_.save();
+        refresh_lists();
+    }
+    update_title();
+    return true;
+}
+
+bool MainFrame::leave_pdf(OpenMode mode)
+{
+    if (!showing_pdf_) {
+        return true;
+    }
+    if (pdf_view_->dirty()) {
+        if (mode == OpenMode::kBrowse || !pdf_view_->maybe_save_annotations()) {
+            return false;
+        }
+    }
+    pdf_view_->close();
+    showing_pdf_ = false;
+    content_->SetSelection(kMarkdownPage);
+    assert(!pdf_view_->has_document() && "leaving closes the PDF");
+    return true;
+}
+
+std::string MainFrame::shown_path() const
+{
+    return showing_pdf_ ? pdf_view_->path() : current_path_;
+}
+
+bool MainFrame::rebuild_tech_note_index(std::string* index_path)
+{
+    assert(index_path != nullptr && "the caller needs to know what was built");
+    // The candidate list comes from the tree's own scan rather than a second
+    // walk of the disk: it already knows every Markdown document under every
+    // root, and walking twice to learn the same thing would be the expensive
+    // half of this feature done for nothing.
+    const std::vector<std::string> documents = files_->document_paths();
+    if (documents.empty()) {
+        wxMessageBox(L"No documents have been scanned yet. Add a folder, or "
+                     L"wait for the scan to finish.",
+                     "DocBoss", wxOK | wxICON_INFORMATION, this);
+        return false;
+    }
+
+    SetStatusText(L"Reading documents for tech notes…");
+    const std::vector<TechNote> notes = scan_tech_notes(documents);
+    const std::string folder = internal_folder(root_paths());
+    const std::string body =
+        tech_notes_index(notes, root_paths(), today_stamp());
+
+    // Written whole rather than appended: this file is derived, and the whole
+    // point is that it matches the documents as they are now.  It is the one
+    // thing in MD_Internal that is NOT hand-editable, which the text says.
+    const std::string failed = write_internal_file(folder, kTechNotesFile, body);
+    if (!failed.empty()) {
+        SetStatusText(wxEmptyString);
+        wxMessageBox(wxString::FromUTF8(failed), "DocBoss", wxOK | wxICON_ERROR,
+                     this);
+        return false;
+    }
+
+    files_->refresh();
+    SetStatusText(wxString::Format("Indexed %zu tech note(s) of %zu document(s)",
+                                   notes.size(), documents.size()));
+    *index_path =
+        path_to_utf8(path_from_utf8(folder) / path_from_utf8(kTechNotesFile));
+    return true;
+}
+
+void MainFrame::on_tech_notes(wxCommandEvent&)
+{
+    std::string index_path;
+    if (!rebuild_tech_note_index(&index_path)) {
+        return;
+    }
+    // Opened straight away: the command is "show me the list", and leaving the
+    // user to find the file in the tree would be answering a different one.
+    open_path(index_path);
+}
+
+void MainFrame::on_refresh_tech_notes(wxCommandEvent&)
+{
+    // Rebuild WITHOUT opening.  The list is derived, so it goes stale the
+    // moment a note is added, renamed or deleted -- and if you are already
+    // reading it, "show me the list" is the wrong command: it would reopen the
+    // document you are looking at and throw away where you had scrolled.
+    std::string index_path;
+    if (!rebuild_tech_note_index(&index_path)) {
+        return;
+    }
+    // Except when it IS the open document, where refreshing has to be visible
+    // or the command appears to have done nothing.  Reloaded rather than
+    // reopened, so an unsaved edit elsewhere is not put at risk -- there can be
+    // none, since this file is rewritten whole, but the guard costs nothing.
+    if (!current_path_.empty() &&
+        norm_path(current_path_) == norm_path(index_path)) {
+        bool ok = false;
+        const std::string text = read_text_file(index_path, ok);
+        if (ok) {
+            const int top = editor_->GetFirstVisibleLine();
+            editor_->SetText(wxString::FromUTF8(text));
+            editor_->EmptyUndoBuffer();
+            editor_->SetFirstVisibleLine(top);
+            dirty_ = false;
+            watcher_.watch(current_path_);
+            update_title();
+            render_preview();
+        }
+    }
+}
+
+void MainFrame::promote_tech_note(const std::string& path)
+{
+    assert(!path.empty() && "nothing to promote");
+
+    // The file is about to be rewritten underneath the editor.  Unsaved edits
+    // would be silently outranked -- the watcher keeps them, so the buffer and
+    // the file would then disagree and the next Ctrl+S would put the front
+    // matter straight back.  Refused, not merged: the user can save in one
+    // keystroke and try again.
+    if (norm_path(path) == norm_path(current_path_) && dirty_) {
+        wxMessageBox(L"Save this document first — updating it as a tech note "
+                     L"rewrites the file, and there are unsaved edits.",
+                     "DocBoss", wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+
+    bool ok = false;
+    const std::string text = read_text_file(path, ok);
+    if (!ok) {
+        wxMessageBox("Could not read that document.", "DocBoss",
+                     wxOK | wxICON_ERROR, this);
+        return;
+    }
+
+    const TechNoteGaps gaps = tech_note_gaps(text);
+    if (!gaps.front_matter && !gaps.guid && !gaps.keyword && !gaps.tn_index) {
+        wxMessageBox("That document is already a tech note.", "DocBoss",
+                     wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+
+    std::tm when{};
+    const std::time_t now = std::time(nullptr);
+    if (localtime_s(&when, &now) != 0) {
+        wxMessageBox("Could not read the clock to number the note.", "DocBoss",
+                     wxOK | wxICON_ERROR, this);
+        return;
+    }
+    // A document that says when it was written is numbered in THAT year: a
+    // note from 2023 indexed today belongs to 2023's sequence, not to this
+    // year's.  Only the number is derived from it; nothing else is guessed.
+    const int year = tech_note_year(text, when.tm_year + 1900);
+
+    std::string number;
+    if (gaps.tn_index) {
+        std::vector<TechNote> existing =
+            scan_tech_notes(files_->document_paths());
+        for (const std::string& issued : issued_tn_indices_) {
+            TechNote reserved;
+            reserved.tn_index = issued;
+            existing.push_back(reserved);
+        }
+        number = format_tn_index(year, next_tn_sequence(existing, year));
+    }
+
+    const std::string title = path_to_utf8(path_from_utf8(path).stem());
+    const std::string updated =
+        promote_to_tech_note(text, new_guid(), number, title);
+    if (updated == text) {
+        return;   // nothing to do; the gaps check above should have caught it
+    }
+
+    const std::string failed = write_text_file_checked(path, updated);
+    if (!failed.empty()) {
+        wxMessageBox(wxString::FromUTF8(failed) + "\n\n" +
+                         wxString::FromUTF8(path),
+                     "DocBoss", wxOK | wxICON_ERROR, this);
+        return;
+    }
+    if (!number.empty() && issued_tn_indices_.size() < 1000) {
+        issued_tn_indices_.push_back(number);
+    }
+
+    // The open document has just changed on disk.  The watcher would reload it
+    // anyway, but only on its next tick -- doing it here means the editor and
+    // the preview show the new front matter immediately, which is the whole
+    // feedback the user gets that anything happened.
+    if (norm_path(path) == norm_path(current_path_)) {
+        editor_->SetText(wxString::FromUTF8(updated));
+        editor_->EmptyUndoBuffer();
+        dirty_ = false;
+        watcher_.watch(current_path_);
+        update_title();
+        render_preview();
+    }
+
+    SetStatusText(number.empty()
+                      ? wxString(L"Updated as a tech note")
+                      : wxString::Format("Updated as tech note %s",
+                                         wxString::FromUTF8(number)));
+}
+
+void MainFrame::on_promote_document(wxCommandEvent&)
+{
+    if (current_path_.empty()) {
+        wxMessageBox("Save this document first, then update it as a tech note.",
+                     "DocBoss", wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+    promote_tech_note(current_path_);
+}
+
+void MainFrame::on_open_internal_folder(wxCommandEvent&)
+{
+    const std::string folder = internal_folder(root_paths());
+    if (folder.empty()) {
+        wxMessageBox(wxString(L"No folder is configured to keep ") +
+                         kInternalName + L" in.\n\nAdd one with "
+                         L"File ▸ Manage folders first.",
+                     "DocBoss", wxOK | wxICON_INFORMATION, this);
+        return;
+    }
+    // Created on demand here too: "open the folder" should show you the
+    // folder, not an error about it not existing yet.
+    std::error_code ec;
+    std::filesystem::create_directories(path_from_utf8(folder), ec);
+    if (ec) {
+        wxMessageBox(wxString::FromUTF8("Could not create " + folder + ":\n\n" +
+                                        ec.message()),
+                     "DocBoss", wxOK | wxICON_ERROR, this);
+        return;
+    }
+    wxExecute("explorer.exe \"" + wxString::FromUTF8(folder) + "\"",
+              wxEXEC_ASYNC);
+}
+
+void MainFrame::on_refresh(wxCommandEvent&)
+{
+    files_->refresh();
+}
+
+void MainFrame::on_toggle_files(wxCommandEvent&)
+{
+    if (files_split_->IsSplit()) {
+        hidden_files_sash_ = files_split_->GetSashPosition();
+        files_split_->Unsplit(recent_split_);
+    } else {
+        files_split_->SplitVertically(recent_split_, content_,
+                                      hidden_files_sash_);
+    }
+    save_pane_visibility();
+}
+
+void MainFrame::on_toggle_outline(wxCommandEvent&)
+{
+    if (outline_split_->IsSplit()) {
+        hidden_outline_sash_ = outline_split_->GetSashPosition();
+        outline_split_->Unsplit(outline_);
+    } else {
+        outline_split_->SplitVertically(outline_, split_,
+                                        hidden_outline_sash_);
+    }
+    save_pane_visibility();
+}
+
+void MainFrame::on_toggle_editor(wxCommandEvent&)
+{
+    if (split_->IsSplit()) {
+        hidden_editor_sash_ = split_->GetSashPosition();
+        split_->Unsplit(editor_);
+    } else {
+        // Whichever pane is alone, restoring the pair is the only sensible
+        // answer: hiding the editor when the preview is already hidden would
+        // leave nothing at all.
+        split_->SplitVertically(editor_, preview_, hidden_editor_sash_);
+    }
+    save_pane_visibility();
+}
+
+void MainFrame::on_toggle_preview(wxCommandEvent&)
+{
+    if (split_->IsSplit()) {
+        hidden_editor_sash_ = split_->GetSashPosition();
+        split_->Unsplit(preview_);   // the editor keeps the whole pane
+    } else {
+        split_->SplitVertically(editor_, preview_, hidden_editor_sash_);
+    }
+    save_pane_visibility();
+}
+
+void MainFrame::save_pane_visibility()
+{
+    // Which panes are showing is recorded the moment it changes, not only in
+    // on_close().  Exit still saves the sash positions, which are only worth
+    // reading once the window has stopped being resized; visibility is a
+    // deliberate choice and should survive however the app happens to end.
+    if (files_split_ != nullptr) {
+        config_.set_show_files(files_split_->IsSplit());
+    }
+    if (outline_split_ != nullptr) {
+        config_.set_show_outline(outline_split_->IsSplit());
+    }
+    if (split_ != nullptr) {
+        // One splitter, two panes, so IsSplit() alone cannot say WHICH one is
+        // hidden.  When unsplit, GetWindow1() is whichever survived.
+        const bool both = split_->IsSplit();
+        config_.set_show_editor(both || split_->GetWindow1() == editor_);
+        config_.set_show_preview(both || split_->GetWindow1() == preview_);
+    }
+    config_.save();
+}
+
+void MainFrame::on_file_types(wxCommandEvent&)
+{
+    const std::string command = handler_command();
+    const bool registered = is_registered(command);
+
+    wxString message;
+    message << (registered
+                    ? "DocBoss is registered as a Markdown handler.\n\n"
+                    : "DocBoss is not currently the registered handler.\n\n");
+    message << "Windows does not let an application make itself the "
+               "default.\nRegistering only adds DocBoss to \"Open with\" and "
+               "to\nSettings > Default apps, where you can choose it.\n\n";
+    message << "Command:\n" << wxString::FromUTF8(command);
+
+    const int answer = wxMessageBox(
+        message + (registered ? "\n\nUnregister?" : "\n\nRegister now?"),
+        "DocBoss file types", wxYES_NO | wxICON_INFORMATION, this);
+    if (answer != wxYES) {
+        return;
+    }
+
+    const RegPlan plan = current_registration_plan();
+    if (registered) {
+        remove_registration(plan);
+    } else if (!apply_registration(plan)) {
+        wxMessageBox("Registration did not complete.", "DocBoss",
+                     wxOK | wxICON_ERROR, this);
+        return;
+    }
+    notify_assoc_changed();
+}
+
+void MainFrame::on_help(wxCommandEvent&)
+{
+    // A window of its own rather than opening HELP.md as a document: reading
+    // the help should not replace whatever the user was editing.
+    HelpDialog dialog(this);
+    dialog.ShowModal();
+}
+
+void MainFrame::on_about(wxCommandEvent&)
+{
+    show_about_box(this);
+}
+
+void MainFrame::on_check_updates(wxCommandEvent&)
+{
+    // Only ever started by the user from the menu.  There is no check on
+    // launch: an app that phones home unasked is not what this one is for.
+    SetStatusText(L"Checking for updates…");
+    check_for_update([this](const ReleaseInfo& info, const std::string& error) {
+        SetStatusText(wxString());
+        if (!error.empty()) {
+            wxMessageBox("Could not check for updates.\n\n" +
+                             wxString::FromUTF8(error),
+                         "DocBoss", wxOK | wxICON_WARNING, this);
+            return;
+        }
+        const std::optional<std::vector<int>> current =
+            parse_version(kAppVersion);
+        if (info.version.empty() || !current) {
+            wxMessageBox("GitHub did not return a version this build "
+                         "understands.",
+                         "DocBoss", wxOK | wxICON_WARNING, this);
+            return;
+        }
+        if (!is_newer(info.version, *current)) {
+            wxMessageBox(wxString("You are up to date (v") + kAppVersion +
+                             ").",
+                         "DocBoss", wxOK | wxICON_INFORMATION, this);
+            return;
+        }
+
+        // A loose copy with no uninstaller beside it updates from the
+        // portable zip; an installed one from the installer.  Decided here,
+        // once, so the download and the hand-off cannot disagree.
+        const std::filesystem::path exe = path_from_utf8(std::string(
+            wxStandardPaths::Get().GetExecutablePath().ToUTF8()));
+        const bool portable = portable_install(
+            path_to_utf8(exe.parent_path()));
+
+        // A release may carry the Python assets but not this build's, in
+        // which case there is nothing to download -- say so and offer the
+        // page rather than failing silently.
+        const std::string& url = portable ? info.portable_url
+                                          : info.setup_url;
+        if (url.empty()) {
+            const int answer = wxMessageBox(
+                wxString("v") + wxString::FromUTF8(info.version_str) +
+                    " is available, but it has no download for this copy.\n\n"
+                    "Open the releases page?",
+                "DocBoss", wxYES_NO | wxICON_INFORMATION, this);
+            if (answer == wxYES) {
+                wxLaunchDefaultBrowser(wxString::FromUTF8(info.html_url));
+            }
+            return;
+        }
+        const int answer = wxMessageBox(
+            wxString("v") + wxString::FromUTF8(info.version_str) +
+                " is available (you have v" + kAppVersion + ").\n\n"
+                "Download and install it now?\n\n"
+                "DocBoss will close, install, and reopen.",
+            "DocBoss", wxYES_NO | wxICON_QUESTION, this);
+        if (answer == wxYES) {
+            install_update(info, portable);
+        }
+    });
+}
+
+void MainFrame::install_update(const ReleaseInfo& info, bool portable)
+{
+    const std::string& url = portable ? info.portable_url : info.setup_url;
+    assert(!url.empty() && "nothing to download");
+    // Asked before the download, not after: a user who cancels here has not
+    // waited for several megabytes first.
+    if (!confirm_discard()) {
+        return;
+    }
+
+    const std::filesystem::path dest =
+        path_from_utf8(std::string(wxStandardPaths::Get()
+                                       .GetTempDir()
+                                       .ToUTF8())) /
+        path_from_utf8(portable ? app_identity().portable_asset
+                                : app_identity().setup_asset);
+
+    SetStatusText(L"Downloading the update…");
+    download_update(
+        url, path_to_utf8(dest),
+        [this, dest, portable](const std::string& error) {
+            SetStatusText(wxString());
+            if (!error.empty()) {
+                wxMessageBox("Could not download the update.\n\n" +
+                                 wxString::FromUTF8(error),
+                             "DocBoss", wxOK | wxICON_WARNING, this);
+                return;
+            }
+            if (portable) {
+                hand_off_to_portable(path_to_utf8(dest));
+            } else {
+                hand_off_to_installer(path_to_utf8(dest));
+            }
+        });
+}
+
+void MainFrame::hand_off_to_installer(const std::string& setup_path)
+{
+    const std::string app_exe =
+        std::string(wxStandardPaths::Get().GetExecutablePath().ToUTF8());
+    const std::string text = installer_batch(
+        setup_path, app_exe,
+        static_cast<unsigned long>(::GetCurrentProcessId()));
+    spawn_handoff_and_close(setup_path + ".cmd", text);
+}
+
+void MainFrame::hand_off_to_portable(const std::string& zip_path)
+{
+    const std::string app_exe =
+        std::string(wxStandardPaths::Get().GetExecutablePath().ToUTF8());
+    // Staging lands beside the zip, like app.py's `zip + ".new"`; the batch
+    // creates it, copies from it, and removes it.
+    const std::string text = portable_batch(
+        zip_path, zip_path + ".new", app_exe,
+        static_cast<unsigned long>(::GetCurrentProcessId()));
+    spawn_handoff_and_close(zip_path + ".cmd", text);
+}
+
+void MainFrame::spawn_handoff_and_close(const std::string& batch_path,
+                                        const std::string& text)
+{
+    // Written as ASCII with CRLF: cmd.exe is the reader, and it is fussier
+    // than anything else in this program about both.
+    {
+        std::ofstream stream(path_from_utf8(batch_path),
+                             std::ios::binary | std::ios::trunc);
+        if (!stream) {
+            wxMessageBox("Could not prepare the update.", "DocBoss",
+                         wxOK | wxICON_WARNING, this);
+            return;
+        }
+        stream.write(text.data(), static_cast<std::streamsize>(text.size()));
+        if (!stream.good()) {
+            wxMessageBox("Could not prepare the update.", "DocBoss",
+                         wxOK | wxICON_WARNING, this);
+            return;
+        }
+    }
+
+    // Windowless, in its own process group, and NOT detached -- exactly what
+    // the Python app uses, and the difference is not cosmetic.
+    //
+    // DETACHED_PROCESS was tried and hung the update: it is mutually
+    // exclusive with CREATE_NO_WINDOW, and the batch's `tasklist | find`
+    // inherited no usable stdin, so find.exe blocked forever reading it and
+    // the installer was never reached.  The app had already exited by then,
+    // so the update simply did not happen and nothing said why -- the exact
+    // failure the wait loop's own comments were written about.
+    //
+    // CREATE_NO_WINDOW keeps the console hidden; the batch still outlives us
+    // because cmd.exe is not tied to this process's lifetime.
+    STARTUPINFOW startup{};
+    startup.cb = sizeof(startup);
+    PROCESS_INFORMATION process{};
+    std::wstring command = L"cmd.exe /c \"" +
+                           path_from_utf8(batch_path).wstring() + L"\"";
+    const BOOL started = ::CreateProcessW(
+        nullptr, command.data(), nullptr, nullptr, FALSE,
+        CREATE_NO_WINDOW | CREATE_NEW_PROCESS_GROUP,
+        nullptr, nullptr, &startup, &process);
+    if (!started) {
+        wxMessageBox("Could not start the update.", "DocBoss",
+                     wxOK | wxICON_WARNING, this);
+        return;
+    }
+    ::CloseHandle(process.hProcess);
+    ::CloseHandle(process.hThread);
+
+    // The batch is already waiting for this process to disappear.
+    updating_ = true;
+    Close(true);
+}
+
+void MainFrame::on_manage_folders(wxCommandEvent&)
+{
+    FoldersDialog dialog(this, config_.roots());
+    if (dialog.ShowModal() != wxID_OK) {
+        return;
+    }
+    config_.set_roots(dialog.roots());
+    config_.save();
+    files_->set_roots(config_.roots());
+}
+
+void MainFrame::on_editor_scrolled(wxStyledTextEvent& event)
+{
+    event.Skip();
+    if (suppress_editor_scroll_) {
+        return;
+    }
+    sync_preview_from_editor();
+}
+
+void MainFrame::sync_preview_from_editor()
+{
+    const int first = editor_->GetFirstVisibleLine();
+    const int visible = editor_->LinesOnScreen();
+    const int total = editor_->GetLineCount();
+    const int span = total - visible;
+    if (span <= 0) {
+        return;
+    }
+    const double ratio = static_cast<double>(first) / span;
+    // Held until the timer fires, not cleared on the next line: scroll_to()
+    // runs ExecuteScript, which returns before the preview has scrolled, so
+    // clearing here would leave the echo unguarded.  That echo maps back
+    // through a different document height and lands a line or so off, which
+    // is invisible on a fast scroll and looks like a bounce on a slow one.
+    suppress_preview_scroll_ = true;
+    preview_->scroll_to(ratio);
+    // Restarting rather than scheduling a fresh callback per sync means a
+    // burst of wheel events stays suppressed until 120 ms after the last.
+    scroll_echo_timer_.Start(kScrollEchoMs, wxTIMER_ONE_SHOT);
+}
+
+void MainFrame::on_scroll_echo_timer(wxTimerEvent&)
+{
+    suppress_preview_scroll_ = false;
+}
+
+void MainFrame::on_preview_scrolled(double ratio)
+{
+    if (suppress_preview_scroll_) {
+        return;
+    }
+    const int visible = editor_->LinesOnScreen();
+    const int total = editor_->GetLineCount();
+    const int span = total - visible;
+    if (span <= 0) {
+        return;
+    }
+    // Clamped because a rubber-band overscroll reports outside [0,1], and
+    // rounded rather than truncated: truncation always biases towards the
+    // top, so the round trip loses a line at a time instead of landing back
+    // where it started.  SetFirstVisibleLine's echo IS synchronous, so this
+    // guard can wrap the call -- unlike the one in sync_preview_from_editor.
+    const double clamped = std::min(1.0, std::max(0.0, ratio));
+    suppress_editor_scroll_ = true;
+    editor_->SetFirstVisibleLine(
+        static_cast<int>(std::lround(clamped * span)));
+    suppress_editor_scroll_ = false;
+}
+
+std::vector<std::string> MainFrame::root_paths() const
+{
+    std::vector<std::string> paths;
+    paths.reserve(config_.roots().size());
+    for (const Root& root : config_.roots()) {
+        paths.push_back(root.path);
+    }
+    return paths;
+}
+
+void MainFrame::update_title()
+{
+    if (showing_pdf_) {
+        const std::string& pdf = pdf_view_->path();
+        const wxString name =
+            pdf.empty() ? wxString("PDF")
+                        : wxString::FromUTF8(
+                              path_to_utf8(path_from_utf8(pdf).filename()));
+        SetTitle(wxString(pdf_view_->dirty() ? "*" : "") + name +
+                 " - DocBoss - v" + kAppVersion);
+        update_close_enabled();
+        return;
+    }
+    wxString name = "Untitled";
+    wxString location;
+    if (!current_path_.empty()) {
+        name = wxString::FromUTF8(
+            path_to_utf8(path_from_utf8(current_path_).filename()));
+        // A document opened from outside every root has nothing in the tree
+        // pointing at it -- Ctrl+O, a drop, a command line or the Windows file
+        // association can all put one here -- so the title carries its full
+        // path.  A document that IS in the tree does not need it: the tree
+        // already shows where it lives, and the path would only crowd out the
+        // name at the front, which is what the taskbar truncates to.
+        if (!is_under_any_root(current_path_, root_paths())) {
+            location = " - " + wxString::FromUTF8(current_path_);
+        }
+    }
+    SetTitle(wxString(dirty_ ? "*" : "") + name + location + " - DocBoss - v" +
+             kAppVersion);
+    update_close_enabled();
+}
+
+void MainFrame::update_close_enabled()
+{
+    // Explicitly, rather than through wxEVT_UPDATE_UI: the toolbar never
+    // delivered that event to this frame, so the button stayed enabled with
+    // nothing open.  Every path that changes what is open already ends in
+    // update_title(), which makes this the one place it has to be done.
+    //
+    // An unsaved buffer with no path still counts as open, or Close would be
+    // dead exactly when discarding is what the user wants.
+    const bool open = showing_pdf_ || !current_path_.empty() ||
+                      (editor_ != nullptr && editor_->GetLength() > 0);
+    if (wxToolBar* bar = GetToolBar()) {
+        bar->EnableTool(kIdCloseDocument, open);
+    }
+    if (wxMenuBar* menus = GetMenuBar()) {
+        menus->Enable(kIdCloseDocument, open);
+    }
+}
+
+void MainFrame::clear_document()
+{
+    editor_->SetText("");
+    editor_->EmptyUndoBuffer();
+    current_path_.clear();
+    watcher_.watch(current_path_);
+    dirty_ = false;
+    // Any warning on show belonged to the document being cleared.
+    SetStatusText(wxString());
+    update_title();
+    render_preview();
+}
+
+void MainFrame::on_close_document(wxCommandEvent&)
+{
+    if (showing_pdf_) {
+        if (leave_pdf(OpenMode::kExplicit)) {
+            update_title();
+        }
+        return;
+    }
+    if (!confirm_discard()) {
+        return;
+    }
+    clear_document();
+}
+
+void MainFrame::insert_block(const std::string& body)
+{
+    assert(editor_ != nullptr && "a snippet needs somewhere to go");
+    assert(!body.empty() && "an empty block is not worth inserting");
+
+    // Every one of these is a block construct -- an alert, a fence, a table,
+    // a figure -- and a block only renders as one when it starts its own line
+    // and is followed by a blank one.  Dropped mid-sentence it would be swept
+    // into the surrounding paragraph and come out as literal text, so the gaps
+    // are made here rather than left to the user to notice afterwards.
+    const int position = editor_->GetCurrentPos();
+    const int length = editor_->GetLength();
+
+    const bool at_line_start =
+        position == 0 || editor_->GetCharAt(position - 1) == '\n';
+    std::string lead;
+    if (!at_line_start) {
+        lead = "\n\n";
+    } else if (position > 1 && editor_->GetCharAt(position - 2) != '\n') {
+        lead = "\n";   // on a fresh line, but the one above has content
+    }
+
+    std::string block = body;
+    if (block.empty() || block.back() != '\n') {
+        block += '\n';
+    }
+
+    // A blank line after matters as much as one before, and for a table it is
+    // the difference between a paragraph and another row: text typed straight
+    // after "|  |  |" is parsed as one.  Skipped when the next line is
+    // already blank, or when there is nothing after this at all.
+    std::string tail;
+    if (position < length && editor_->GetCharAt(position) != '\n') {
+        tail = "\n";
+    }
+
+    editor_->InsertText(position, wxString::FromUTF8(lead + block + tail));
+    // On the line immediately after the block -- the blank one, when there is
+    // one -- rather than stranded at the start of what the user is about to
+    // replace.
+    editor_->GotoPos(position + static_cast<int>(lead.size() + block.size()));
+    editor_->SetFocus();
+}
+
+void MainFrame::on_snippet(wxCommandEvent& event)
+{
+    const int index = event.GetId() - kIdSnippetBase;
+    if (index < 0 || static_cast<std::size_t>(index) >= std::size(kSnippets)) {
+        return;   // an id outside the range this handler was bound for
+    }
+    insert_block(kSnippets[static_cast<std::size_t>(index)].body);
+}
+
+void MainFrame::on_insert_image(wxCommandEvent&)
+{
+    // Opening in the document's own folder is the difference between picking
+    // the image next to the note and hunting for it: figures nearly always
+    // live beside the document that shows them.
+    const wxString start =
+        current_path_.empty()
+            ? wxString()
+            : wxString::FromUTF8(path_to_utf8(
+                  path_from_utf8(current_path_).parent_path()));
+
+    wxFileDialog dialog(this, L"Insert image file", start, "", kImageWildcard,
+                        wxFD_OPEN | wxFD_FILE_MUST_EXIST);
+    if (dialog.ShowModal() != wxID_OK) {
+        return;
+    }
+
+    const std::string chosen = std::string(dialog.GetPath().ToUTF8());
+    const std::string link = markdown_image_link(chosen, current_path_);
+    if (link.empty()) {
+        return;
+    }
+    insert_block(link);
+
+    // Worth saying out loud: an absolute path breaks the moment the document
+    // is sent anywhere.  Decided from the paths rather than by sniffing the
+    // link text -- the same two conditions markdown_image_link() uses.
+    if (current_path_.empty()) {
+        SetStatusText(L"Absolute path used — the document has not been saved "
+                      L"anywhere yet.");
+    } else if (path_from_utf8(chosen).root_name() !=
+               path_from_utf8(current_path_).root_name()) {
+        SetStatusText(L"Absolute path used — the image is on a different "
+                      L"drive from the document.");
+    }
+}
+
+
+bool MainFrame::confirm_discard()
+{
+    // Only one file is open, so only one kind of unsaved work can be pending:
+    // a PDF's highlights, or a document's edits.
+    if (showing_pdf_) {
+        return pdf_view_->maybe_save_annotations();
+    }
+    if (!dirty_) {
+        return true;
+    }
+    const int answer =
+        wxMessageBox(L"Save changes to the current document?", "DocBoss",
+                     wxYES_NO | wxCANCEL | wxICON_QUESTION, this);
+    if (answer == wxCANCEL) {
+        return false;
+    }
+    if (answer == wxYES) {
+        wxCommandEvent unused;
+        on_save(unused);
+        return !dirty_;
+    }
+    return true;
+}
+
+void MainFrame::on_close(wxCloseEvent& event)
+{
+    // install_update() already asked, and the installer is waiting on this
+    // process to exit -- asking again here would stall the handoff behind a
+    // dialog the user has effectively already answered.
+    if (!updating_ && event.CanVeto() && !confirm_discard()) {
+        event.Veto();
+        return;
+    }
+    const wxSize size = GetSize();
+    config_.set_window_size(size.GetWidth(), size.GetHeight());
+    ConfigGeometryStore geometry({});
+    if (SaveGeometry(geometry)) {
+        config_.set_window_geometry(geometry.values());
+    }
+    // Save the sash a hidden pane *would* return to, not the meaningless
+    // value an unsplit splitter reports.
+    if (split_ != nullptr) {
+        const bool both = split_->IsSplit();
+        config_.set_show_editor(both || split_->GetWindow1() == editor_);
+        config_.set_show_preview(both || split_->GetWindow1() == preview_);
+        config_.set_editor_sash(both ? split_->GetSashPosition()
+                                     : hidden_editor_sash_);
+    }
+    if (outline_split_ != nullptr) {
+        config_.set_show_outline(outline_split_->IsSplit());
+        config_.set_outline_sash(outline_split_->IsSplit()
+                                     ? outline_split_->GetSashPosition()
+                                     : hidden_outline_sash_);
+    }
+    if (files_split_ != nullptr) {
+        config_.set_show_files(files_split_->IsSplit());
+        config_.set_files_sash(files_split_->IsSplit()
+                                   ? files_split_->GetSashPosition()
+                                   : hidden_files_sash_);
+    }
+    if (recent_split_ != nullptr) {
+        config_.set_recent_sash(recent_split_->GetSashPosition());
+    }
+    if (favorites_split_ != nullptr) {
+        config_.set_favorites_sash(favorites_split_->GetSashPosition());
+    }
+    if (files_ != nullptr) {
+        // Which folders were open is part of the layout: reopening collapsed
+        // means clicking back down to the same folder every launch.
+        config_.set_expanded_folders(files_->expanded_folders());
+    }
+    config_.save();
+    // After Config: each save re-reads the file and keeps the other's keys,
+    // so the order does not matter for correctness -- only this one is last.
+    if (pdf_view_ != nullptr) {
+        pdf_view_->remember_layout();
+    }
+    pdf_settings_.save();
+    event.Skip();
+}
+
+}  // namespace docboss
+

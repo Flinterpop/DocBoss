@@ -1,0 +1,28 @@
+# This repo is PUBLIC, and the app it builds is pointed at folders of
+# export-controlled documents.  Nothing a user works on belongs here.
+
+# Build trees (claude-scratch/ lives inside build/, so it is covered).
+build/
+build-*/
+dist/
+installer/
+
+# Local editor / tool settings
+.claude/
+*.user
+*.aps
+.vs/
+
+# Documents dropped into the repo folder.  The rule is shape-based, not
+# name-based, because MDBoss learned the hard way that naming them one at a
+# time does not work.  The tracked Markdown at the root is re-included by name.
+/*.pdf
+/*.md
+!/README.md
+!/HELP.md
+!/CLAUDE.md
+*.toc
+*.bookmarks.json
+*Password*
+*password*
+logins.md
