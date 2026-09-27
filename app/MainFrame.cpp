@@ -29,6 +29,7 @@
 #include "mdboss/FindBar.h"
 #include "mdboss/FindInFilesDialog.h"
 #include "mdboss/FoldersDialog.h"
+#include "PageIcon.h"
 #include "PdfInfo.h"
 #include "Publish.h"
 #include "Version.h"
@@ -367,7 +368,7 @@ void MainFrame::build_menu()
     // Publish is the everyday command: no dialog, the PDF lands beside the
     // document.  Export stays for the one-off copy saved somewhere else.
     file->Append(kIdPublish, L"&Publish PDF\tCtrl+Shift+P");
-    file->Append(kIdOpenPublished, L"Open pu&blished PDF\tCtrl+Shift+O");
+    file->Append(kIdOpenPublished, L"&View as PDF\tCtrl+Shift+O");
     file->Append(kIdPublishStale, L"Publish all s&tale PDFs…");
     file->Append(kIdStopBatch, L"Sto&p publishing");
     file->Enable(kIdStopBatch, false);   // only while a batch runs
@@ -506,6 +507,10 @@ void MainFrame::build_toolbar()
         {kIdPublish, L"Publish PDF", wxART_PRINT,
          L"Write this document's PDF beside it, replacing the last one "
          L"(Ctrl+Shift+P)", false, false},
+        // Drawn with DocBoss's own red PDF page (see below), not art.
+        {kIdOpenPublished, L"View as PDF", wxART_NORMAL_FILE,
+         L"Show this document's published PDF, or go back from a PDF to "
+         L"its document (Ctrl+Shift+O)", false, false},
         {kIdCloseDocument, L"Close", wxART_CLOSE,
          L"Close the open document and empty the editor (Ctrl+W)", false,
          true},
@@ -538,8 +543,12 @@ void MainFrame::build_toolbar()
         // now scans the sources for this, because it is easy to repeat.
         const wxString tip =
             wxString(tool.label) + L"  —  " + wxString(tool.detail);
+        // View as PDF wears the same red page the tree gives a PDF, so the
+        // button looks like the rows it takes you to.
         const wxBitmapBundle icon =
-            wxArtProvider::GetBitmapBundle(tool.art, wxART_TOOLBAR);
+            tool.id == kIdOpenPublished
+                ? page_icon_bundle(kPdfBand, true)
+                : wxArtProvider::GetBitmapBundle(tool.art, wxART_TOOLBAR);
         if (tool.check) {
             bar->AddCheckTool(tool.id, tool.label, icon, wxBitmapBundle(), tip);
         } else {
@@ -2348,16 +2357,31 @@ void MainFrame::end_publish_render()
 
 void MainFrame::on_open_published(wxCommandEvent&)
 {
-    if (showing_pdf_ || current_path_.empty()) {
+    // Both directions, so one button (or Ctrl+Shift+O) flips between a
+    // document and its PDF.
+    std::error_code ec;
+    if (showing_pdf_) {
+        const std::string source = source_document_for(pdf_view_->path());
+        if (source.empty()) {
+            SetStatusText(L"This PDF has no document beside it.");
+            return;
+        }
+        open_path(source);
+        return;
+    }
+    if (current_path_.empty()) {
+        SetStatusText(L"Open a document to view its PDF.");
         return;
     }
     const std::string pdf = published_pdf_path(current_path_);
-    std::error_code ec;
     if (!std::filesystem::exists(path_from_utf8(pdf), ec)) {
         SetStatusText(L"This document has not been published yet "
                       L"(Ctrl+Shift+P).");
         return;
     }
+    // An unsaved edit is asked about by open_path, as for any switch.  What
+    // shows is the last publication, not the text on screen: a stale row in
+    // the tree is the cue to publish first.
     open_path(pdf);
 }
 

@@ -29,6 +29,7 @@
 #include <thread>
 
 #include "DocDeps.h"
+#include "PageIcon.h"
 #include "Publish.h"
 #include "mdboss/FileScan.h"
 #include "mdboss/PathUtf8.h"
@@ -188,48 +189,6 @@ enum StateIcon : int {
     kIconPdf = 4,         // a PDF with no source here
 };
 
-// A page outline with a coloured band across its foot (or none).  Built
-// pixel by pixel rather than shipped, so there is nothing to package and it
-// scales to the DPI the control asks for -- and built as a wxImage with an
-// explicit alpha channel, because GDI drawing into a 32-bit bitmap leaves the
-// alpha at zero and the icon comes out invisible.
-wxBitmap page_icon(int size, const wxColour& band, bool tall_band)
-{
-    wxImage image(size, size);
-    image.InitAlpha();
-    const int left = std::max(1, size / 6);
-    const int right = size - 1 - std::max(1, size / 6);
-    const int border = std::max(1, size / 16);
-    const int band_top =
-        band.IsOk() ? size - 1 - (tall_band ? size / 3 : size / 4) : size;
-    for (int y = 0; y < size; ++y) {       // bounded by the icon size
-        for (int x = 0; x < size; ++x) {   // bounded by the icon size
-            const bool inside = x >= left && x <= right;
-            if (!inside) {
-                image.SetAlpha(x, y, 0);
-                continue;
-            }
-            const bool edge = x < left + border || x > right - border ||
-                              y < border || y > size - 1 - border;
-            unsigned char r = 255;
-            unsigned char g = 255;
-            unsigned char b = 255;
-            if (edge) {
-                r = 90;
-                g = 100;
-                b = 115;
-            } else if (y >= band_top) {
-                r = band.Red();
-                g = band.Green();
-                b = band.Blue();
-            }
-            image.SetRGB(x, y, r, g, b);
-            image.SetAlpha(x, y, 255);
-        }
-    }
-    return wxBitmap(image);
-}
-
 wxImageList* make_state_icons(int size)
 {
     assert(size > 0 && "icons need a size");
@@ -239,7 +198,7 @@ wxImageList* make_state_icons(int size)
     icons->Add(page_icon(size, wxColour(), false));
     icons->Add(page_icon(size, wxColour(40, 150, 70), false));
     icons->Add(page_icon(size, wxColour(214, 120, 0), false));
-    icons->Add(page_icon(size, wxColour(200, 38, 38), true));
+    icons->Add(page_icon(size, kPdfBand, true));
     assert(icons->GetImageCount() == kIconPdf + 1 &&
            "every StateIcon has an image");
     return icons;

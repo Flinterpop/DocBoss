@@ -22,6 +22,22 @@ std::string published_pdf_path(const std::string& md_path)
     return mdboss::path_to_utf8(target);
 }
 
+std::string source_document_for(const std::string& pdf_path)
+{
+    assert(!pdf_path.empty() && "a PDF path is needed");
+    const std::filesystem::path pdf = mdboss::path_from_utf8(pdf_path);
+    // The extensions FileScan's is_markdown() accepts, most common first.
+    for (const char* ext : {".md", ".markdown", ".mdown", ".mkd", ".mdwn"}) {
+        std::filesystem::path candidate = pdf;
+        candidate.replace_extension(ext);
+        std::error_code ec;
+        if (std::filesystem::is_regular_file(candidate, ec)) {
+            return mdboss::path_to_utf8(candidate);
+        }
+    }
+    return {};
+}
+
 bool is_pdf(const std::string& name)
 {
     if (name.size() < 4) {

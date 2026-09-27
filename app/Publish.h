@@ -20,6 +20,11 @@ std::string published_pdf_path(const std::string& md_path);
 // True for a ".pdf" name, any case.
 bool is_pdf(const std::string& name);
 
+// The reverse of published_pdf_path: the Markdown document beside
+// `pdf_path` that it was published from -- "<stem>.md", or any other
+// Markdown extension -- or empty when there is none on disk.
+std::string source_document_for(const std::string& pdf_path);
+
 }  // namespace docboss
 
 #endif  // DOCBOSS_APP_PUBLISH_H

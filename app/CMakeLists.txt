@@ -50,6 +50,8 @@ add_executable(DocBoss WIN32
     MainFrame.h
     DocTreePanel.cpp
     DocTreePanel.h
+    PageIcon.cpp
+    PageIcon.h
     PdfView.cpp
     PdfView.h
     HelpDialog.cpp
