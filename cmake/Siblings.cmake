@@ -51,7 +51,7 @@ endfunction()
 set(MDBOSS_DIR "C:/source/MDBoss" CACHE PATH "Path to the MDBoss repo")
 set(MDBOSS_EXPECTED_COMMIT "618101fa79876dafc16ac061648b0118d31176b6")
 set(PDFBOSS_DIR "C:/source/PDFBoss" CACHE PATH "Path to the PDFBoss repo")
-set(PDFBOSS_EXPECTED_COMMIT "089673c7afa9511813d56b505a32c6768a7fd3ec")
+set(PDFBOSS_EXPECTED_COMMIT "f4d2032c562389ec7875638516326d78500b7582")
 
 foreach(_probe "${MDBOSS_DIR}/MDBossCpp/app/AppIdentity.h"
                "${PDFBOSS_DIR}/PDFBossCpp/app/PdfDocument.h")
