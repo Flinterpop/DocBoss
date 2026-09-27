@@ -29,6 +29,7 @@
 #include "mdboss/FindBar.h"
 #include "mdboss/FindInFilesDialog.h"
 #include "mdboss/FoldersDialog.h"
+#include "DocDeps.h"
 #include "PageIcon.h"
 #include "PdfInfo.h"
 #include "Publish.h"
@@ -347,7 +348,11 @@ MainFrame::MainFrame()
         SetIcon(icon);
     }
 
-    CreateStatusBar();
+    // Two fields: messages on the left, the open document's PDF state on the
+    // right (update_pdf_indicator), so a message never hides the state.
+    CreateStatusBar(2);
+    const int widths[] = {-1, FromDIP(280)};
+    GetStatusBar()->SetStatusWidths(2, widths);
 
     build_menu();
     build_panes();
@@ -380,6 +385,9 @@ void MainFrame::build_menu()
     file->Append(kIdOpenTemplates, "Open &templates folder");
     file->Append(kIdManageFolders, L"&Manage folders…");
     file->Append(kIdToggleFavorite, "Add to &favorites\tCtrl+D");
+    file->AppendSeparator();
+    // Menu only: registering as the Markdown handler is done once, not daily.
+    file->Append(kIdFileTypes, L"File t&ypes…");
     file->AppendSeparator();
     file->Append(wxID_EXIT, "E&xit\tAlt+F4");
 
@@ -507,10 +515,6 @@ void MainFrame::build_toolbar()
         {kIdPublish, L"Publish PDF", wxART_PRINT,
          L"Write this document's PDF beside it, replacing the last one "
          L"(Ctrl+Shift+P)", false, false},
-        // Drawn with DocBoss's own red PDF page (see below), not art.
-        {kIdOpenPublished, L"View as PDF", wxART_NORMAL_FILE,
-         L"Show this document's published PDF, or go back from a PDF to "
-         L"its document (Ctrl+Shift+O)", false, false},
         {kIdCloseDocument, L"Close", wxART_CLOSE,
          L"Close the open document and empty the editor (Ctrl+W)", false,
          true},
@@ -525,12 +529,11 @@ void MainFrame::build_toolbar()
         {kIdTogglePreview, L"Preview", wxART_FIND,
          L"Show or hide the rendered preview", true, false},
         {kIdToggleFrontMatter, L"Hide YAML", wxART_MINUS,
-         L"Hide a YAML front-matter block at the top of the file", true, true},
-
-        // Help lives on the Help menu, not here: it is not something reached
-        // often enough to earn a permanent button.
-        {kIdFileTypes, L"File types…", wxART_EXECUTABLE_FILE,
-         L"Register DocBoss as a handler for Markdown files", false, false},
+         L"Hide a YAML front-matter block at the top of the file", true,
+         false},
+        // File types and Help live on the menus, not here: neither is reached
+        // often enough to earn a permanent button.  View as PDF is added
+        // after the loop, at the far right.
     };
 
     wxToolBar* bar = CreateToolBar(wxTB_HORIZONTAL | wxTB_FLAT);
@@ -543,12 +546,8 @@ void MainFrame::build_toolbar()
         // now scans the sources for this, because it is easy to repeat.
         const wxString tip =
             wxString(tool.label) + L"  —  " + wxString(tool.detail);
-        // View as PDF wears the same red page the tree gives a PDF, so the
-        // button looks like the rows it takes you to.
         const wxBitmapBundle icon =
-            tool.id == kIdOpenPublished
-                ? page_icon_bundle(kPdfBand, true)
-                : wxArtProvider::GetBitmapBundle(tool.art, wxART_TOOLBAR);
+            wxArtProvider::GetBitmapBundle(tool.art, wxART_TOOLBAR);
         if (tool.check) {
             bar->AddCheckTool(tool.id, tool.label, icon, wxBitmapBundle(), tip);
         } else {
@@ -568,6 +567,22 @@ void MainFrame::build_toolbar()
             bar->AddSeparator();
         }
     }
+
+    // View as PDF at the far right, on its own: it is the one button that
+    // switches between the two kinds of file rather than acting on one.  It
+    // wears the red page the tree gives a PDF, so it looks like the rows it
+    // takes you to.
+    bar->AddStretchableSpace();
+    const wxBitmapBundle pdf_icon = page_icon_bundle(kPdfBand, true);
+    const wxBitmap pdf_normal = pdf_icon.GetBitmap(wxDefaultSize);
+    bar->AddTool(kIdOpenPublished, L"View as PDF", pdf_icon,
+                 pdf_normal.IsOk()
+                     ? wxBitmapBundle::FromBitmap(pdf_normal.ConvertToDisabled())
+                     : wxBitmapBundle(),
+                 wxITEM_NORMAL,
+                 wxString(L"View as PDF") + L"  —  " +
+                     L"Show this document's published PDF, or go back from a "
+                     L"PDF to its document (Ctrl+Shift+O)");
 
     bar->ToggleTool(kIdToggleFiles, config_.show_files());
     bar->ToggleTool(kIdToggleOutline, config_.show_outline());
@@ -2200,6 +2215,7 @@ void MainFrame::on_publish_timer(wxTimerEvent&)
         // The marker beside the document changes, and a first publication
         // turns up in the scan.
         files_->refresh();
+        update_pdf_indicator();
     });
 }
 
@@ -3042,8 +3058,63 @@ std::vector<std::string> MainFrame::root_paths() const
     return paths;
 }
 
+void MainFrame::update_pdf_indicator()
+{
+    // What the open document's PDF looks like right now, in two places: the
+    // right-hand status field says it, and the View as PDF button's band
+    // shows it in the tree's colours -- green up to date, orange out of
+    // date, plain not published, red when a PDF is what is on screen.
+    enum Shown { kShowNothing, kShowPdf, kShowNone, kShowCurrent, kShowStale };
+    Shown shown = kShowNothing;
+    wxString text;
+    if (showing_pdf_) {
+        shown = kShowPdf;
+        text = source_document_for(pdf_view_->path()).empty()
+                   ? L"PDF — no document beside it"
+                   : L"Published PDF — View as PDF goes back";
+    } else if (!current_path_.empty()) {
+        const PdfState state = publication_state_on_disk(current_path_);
+        if (state == PdfState::kNone) {
+            shown = kShowNone;
+            text = L"Not published";
+        } else if (state == PdfState::kStale || dirty_) {
+            // Unsaved edits make the PDF out of date just as surely: it no
+            // longer says what the editor says.
+            shown = kShowStale;
+            text = dirty_ && state == PdfState::kCurrent
+                       ? L"PDF out of date — unsaved edits"
+                       : L"PDF out of date — Publish (Ctrl+Shift+P)";
+        } else {
+            shown = kShowCurrent;
+            text = L"PDF up to date";
+        }
+    }
+    SetStatusText(text, 1);
+
+    // Only when it changes: a new bundle per keystroke would be waste.
+    if (static_cast<int>(shown) == pdf_indicator_shown_) {
+        return;
+    }
+    pdf_indicator_shown_ = static_cast<int>(shown);
+    wxToolBar* bar = GetToolBar();
+    if (bar == nullptr) {
+        return;
+    }
+    wxColour band = kPdfBand;
+    if (shown == kShowCurrent) {
+        band = wxColour(40, 150, 70);
+    } else if (shown == kShowStale) {
+        band = wxColour(214, 120, 0);
+    } else if (shown == kShowNone) {
+        band = wxColour();   // a plain page: nothing published
+    }
+    bar->SetToolNormalBitmap(kIdOpenPublished, page_icon_bundle(band, true));
+    assert(pdf_indicator_shown_ >= 0);
+}
+
 void MainFrame::update_title()
 {
+    update_pdf_indicator();
     if (showing_pdf_) {
         const std::string& pdf = pdf_view_->path();
         const wxString name =

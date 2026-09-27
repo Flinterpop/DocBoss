@@ -36,6 +36,13 @@ std::int64_t newest_dependency(const std::string& md_path);
 // the PDF.  Reads each such document; call it on a worker.
 void apply_dependency_times(Pairing& pairing);
 
+// One document's publication state, straight from the disk, by the same
+// rules the tree uses: kNone when <stem>.pdf is not beside it; kStale when
+// the document, or a local image it shows, was written after the PDF;
+// kCurrent otherwise.  Reads that one document (1 MB cap), so it is cheap
+// enough for the UI thread; the frame uses it for the open document.
+PdfState publication_state_on_disk(const std::string& md_path);
+
 }  // namespace docboss
 
 #endif  // DOCBOSS_APP_DOC_DEPS_H

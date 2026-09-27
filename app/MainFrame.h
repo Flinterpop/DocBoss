@@ -173,6 +173,10 @@ private:
     void on_publish_timer(wxTimerEvent& event);
     // Back to the user's own Hide YAML setting after a publish.
     void end_publish_render();
+    // The open document's PDF state, in the right-hand status field and on
+    // the View as PDF button.  Called from update_title(), which every change
+    // of document or dirty state already ends in, and after a publish.
+    void update_pdf_indicator();
     // Publish all stale: every document whose PDF is out of date, at or
     // below `folder` (everything, when empty), one at a time through the
     // ordinary Publish path, then back to what was open.
@@ -300,6 +304,9 @@ private:
     std::vector<std::string> batch_errors_;
     // What was showing when the batch started, to go back to.
     std::string batch_return_;
+    // What update_pdf_indicator last drew on the button, so it redraws only
+    // on a change; -1 before the first time.
+    int pdf_indicator_shown_ = -1;
     // How many were still queued when File > Stop publishing was used.
     std::size_t batch_stopped_ = 0;
     // What the document being printed says about itself (DocMeta.h): the

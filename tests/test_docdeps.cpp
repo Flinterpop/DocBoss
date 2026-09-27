@@ -55,6 +55,37 @@ TEST_CASE("percent escapes, queries and duplicates are handled", "[docdeps]")
     CHECK(docboss::local_references(text) == Refs{"my figure.png"});
 }
 
+TEST_CASE("one document's state is read straight from the disk", "[docdeps]")
+{
+    const fs::path dir = fs::temp_directory_path() / "docboss_state_test";
+    std::error_code ec;
+    fs::remove_all(dir, ec);
+    fs::create_directories(dir / "img", ec);
+    const auto now = fs::file_time_type::clock::now();
+    const auto earlier = now - std::chrono::hours(2);
+    const auto between = now - std::chrono::hours(1);
+    std::ofstream(dir / "a.md") << "# A\n\n![f](img/f.png)\n";
+    std::ofstream(dir / "img" / "f.png") << "png";
+    std::ofstream(dir / "a.pdf") << "%PDF";
+    const std::string md = mdboss::path_to_utf8(dir / "a.md");
+
+    fs::last_write_time(dir / "a.md", earlier, ec);
+    fs::last_write_time(dir / "img" / "f.png", earlier, ec);
+    fs::last_write_time(dir / "a.pdf", between, ec);
+    CHECK(docboss::publication_state_on_disk(md) == docboss::PdfState::kCurrent);
+
+    fs::last_write_time(dir / "a.md", now, ec);   // text edited since
+    CHECK(docboss::publication_state_on_disk(md) == docboss::PdfState::kStale);
+
+    fs::last_write_time(dir / "a.md", earlier, ec);
+    fs::last_write_time(dir / "img" / "f.png", now, ec);   // figure replaced
+    CHECK(docboss::publication_state_on_disk(md) == docboss::PdfState::kStale);
+
+    fs::remove(dir / "a.pdf", ec);
+    CHECK(docboss::publication_state_on_disk(md) == docboss::PdfState::kNone);
+    fs::remove_all(dir, ec);
+}
+
 TEST_CASE("a newer image makes a current PDF stale", "[docdeps]")
 {
     const fs::path dir = fs::temp_directory_path() / "docboss_deps_test";

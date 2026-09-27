@@ -1,6 +1,6 @@
 # CLAUDE.md
 
-*Last updated: 26 Sep 2026*
+*Last updated: 27 Sep 2026*
 
 Guidance for Claude Code working in this repository.
 
@@ -62,6 +62,8 @@ PDFBoss needed no change: its pulled units were already leaves free of `Config`,
 - **Page headers and footers** are CSS `@page` margin boxes (`DocMeta.cpp`, `add_page_margin_boxes`) in a `<style media="print">` added only while a print renders — Chromium's own header/footer stays off. Title from `mdrender::document_title` (front matter, else first heading, else file stem), version and date from the front matter (date falls back to `today_stamp()`). Switch: `docboss_pdf_page_headers`, File menu.
 - **PDF properties** (Title, Author, Subject, Keywords, Creator=DocBoss) are stamped after the print by `PdfInfo.cpp` with MuPDF: `fz_set_metadata` + an incremental save **to the file's own path**. Pass the path — `pdf_save_document(..., nullptr, ...)` throws "no output to write to", which is exactly the bug PDFBoss's `save_incremental()` had until PDFBoss `089673c`. Both MuPDF files disable C4611 as PDFBoss's `PdfDocument.cpp` does; the rule that makes that safe is no object with a destructor inside an `fz_try`.
 - **Stale also means "a figure changed"** (`DocDeps.cpp`): after pairing, the tree's worker reads each document whose PDF still looks current (1 MB cap) for local image references — `![](…)`, `<img src>`, and reference definitions naming an image — and marks it stale when any is newer than the PDF. Only documents with a current PDF are read; the scan itself still opens nothing.
+- **The open document's PDF state** shows in status field 1 and as the band colour of the View as PDF button (far right of the toolbar), via `update_pdf_indicator()`, called from `update_title()` and after a publish. It reads the disk each time (`publication_state_on_disk`: text or a referenced image newer than the PDF; unsaved edits also count as out of date); the button's bitmap is only replaced when the state changes.
+- **`--profile` is its own single instance** (27 Sep 2026): the mutex and window property carry a fingerprint of the profile folder. Before that a scratch copy shared the default slot and handed its command-line document to the user's own running DocBoss -- which happened, during testing. Test copies must always run with `--profile`.
 - **Publish all stale** runs each document through the ordinary Publish in browse mode with `navigating_` set, so it touches neither Recent, history nor `config.json`; errors are collected into one summary; **File ▸ Stop publishing** clears the queue and lets the PDF in flight finish.
 - **Page keys** (PgUp/PgDn/Space/Home/End) act only while focus is inside the PDF page (`wxEVT_CHAR_HOOK` on `PdfView`), never frame-wide, or they would be taken from the editor.
 - **Tree state icons** are built pixel by pixel as a `wxImage` with alpha. Drawing with a `wxMemoryDC` into a 32-bit bitmap leaves alpha at 0 and the icons come out invisible — that happened first.

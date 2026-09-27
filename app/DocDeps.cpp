@@ -216,6 +216,29 @@ std::int64_t newest_dependency(const std::string& md_path)
     return newest;
 }
 
+PdfState publication_state_on_disk(const std::string& md_path)
+{
+    namespace fs = std::filesystem;
+    assert(!md_path.empty() && "a document is needed");
+    const fs::path doc = mdboss::path_from_utf8(md_path);
+    fs::path pdf = doc;
+    pdf.replace_extension(".pdf");
+    std::error_code ec;
+    const fs::file_time_type pdf_time = fs::last_write_time(pdf, ec);
+    if (ec) {
+        return PdfState::kNone;   // no PDF beside it (or unreadable)
+    }
+    const fs::file_time_type doc_time = fs::last_write_time(doc, ec);
+    const std::int64_t pdf_ticks =
+        static_cast<std::int64_t>(pdf_time.time_since_epoch().count());
+    if (!ec && static_cast<std::int64_t>(doc_time.time_since_epoch().count()) >
+                   pdf_ticks) {
+        return PdfState::kStale;
+    }
+    return newest_dependency(md_path) > pdf_ticks ? PdfState::kStale
+                                                  : PdfState::kCurrent;
+}
+
 void apply_dependency_times(Pairing& pairing)
 {
     for (auto& [key, link] : pairing.published) {   // bounded by the scan

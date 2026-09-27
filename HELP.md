@@ -34,7 +34,8 @@ Click a document to edit it; click a PDF to read it. **Only one file is open at 
 - **What you see is what you get.** The PDF is the preview, printed: the same styling, code colours, mermaid diagrams, KaTeX and tables, laid out at the page width the preview already uses. DocBoss renders the page afresh and waits for it to finish drawing before printing, so a diagram is never caught half-drawn.
 - **Right-click any document in the tree ▸ Publish PDF** publishes that one — it is opened first if it is not already the open document.
 - **Publish all stale PDFs** (**File** menu) republishes every document marked stale, one after another, and then returns you to what you had open. Right-click a folder ▸ **Publish stale PDFs here** does the same for just that folder and those below it; the menu shows how many there are. You are asked once before it starts, since it replaces every one of those PDFs. **File ▸ Stop publishing** stops it after the PDF being written at the moment. Anything that could not be published is listed at the end.
-- **View as PDF** — the red page button on the toolbar, **File ▸ View as PDF** or **Ctrl+Shift+O** — shows the open document's published PDF, to check it before sending it anywhere. Press it again on the PDF to go back to the document. It shows the *last publication*: if the row is orange, publish first. Right-click a document ▸ **Open published PDF** does the same from the tree.
+- **View as PDF** — the red page button at the right-hand end of the toolbar, **File ▸ View as PDF** or **Ctrl+Shift+O** — shows the open document's published PDF, to check it before sending it anywhere. Press it again on the PDF to go back to the document. It shows the *last publication*: if the row is orange, publish first.
+- **Is this document's PDF up to date?** Two places tell you, for whatever document is open. The **right-hand end of the status bar** says *PDF up to date*, *PDF out of date* (with *unsaved edits* when that is the reason) or *Not published*. The **View as PDF** button's band matches the tree: **green** up to date, **orange** out of date, a **plain** page when nothing is published, and **red** while you are looking at a PDF. Both change the moment you edit, save or publish. Right-click a document ▸ **Open published PDF** does the same from the tree.
 - **Published PDFs are output.** Publishing again replaces the PDF, so highlights added to a *published* PDF are lost the next time it is published. Highlight other people's PDFs, not your own.
 
 **Moving or renaming a document takes its PDF with it** (and the PDF's topics and bookmarks files), so the pair never comes apart. **Deleting** a document leaves its PDF alone; it then shows as a PDF with no document beside it.
@@ -258,7 +259,7 @@ BannerCheck.md - C:\Users\you\Downloads\BannerCheck.md - DocBoss - v1.0.0
 
 ## Making DocBoss your Markdown app
 
-Click **File types…** on the toolbar and press **Register**. That adds DocBoss to the **Open with** menu for `.md`, `.markdown`, `.mdown`, `.mkd` and `.mdwn`, and lists it in **Settings → Default apps**. The installer offers the same thing as a checkbox, and uninstalling removes it again.
+Choose **File ▸ File types…** and press **Register**. That adds DocBoss to the **Open with** menu for `.md`, `.markdown`, `.mdown`, `.mkd` and `.mdwn`, and lists it in **Settings → Default apps**. The installer offers the same thing as a checkbox, and uninstalling removes it again.
 
 Windows does not let any application make itself the default for a file type, so one step is yours and cannot be automated: right-click a Markdown file, choose **Open with → Choose another app**, pick DocBoss and tick **Always**. The **Windows default apps…** button in the dialog opens the settings page for you.
 

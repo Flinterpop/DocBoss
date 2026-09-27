@@ -59,6 +59,23 @@ TEST_CASE("the default profile is DocBoss's own folder", "[identity]")
     CHECK(identity.data_dir != identity.staging_dir);
 }
 
+TEST_CASE("each profile is its own single instance", "[identity]")
+{
+    // A scratch copy must never hand its document to the user's own window.
+    const mdboss::AppIdentity real = docboss::make_identity("");
+    const mdboss::AppIdentity a = docboss::make_identity("D:\\scratch\\one");
+    const mdboss::AppIdentity b = docboss::make_identity("D:\\scratch\\two");
+    const mdboss::AppIdentity a_again = docboss::make_identity("d:/SCRATCH/one");
+    CHECK(real.instance_mutex == L"Local\\DocBoss.SingleInstance");
+    CHECK(a.instance_mutex != real.instance_mutex);
+    CHECK(a.instance_mutex != b.instance_mutex);
+    CHECK(a.instance_prop != real.instance_prop);
+    // The same folder, spelt differently, is the same instance.
+    CHECK(a.instance_mutex == a_again.instance_mutex);
+    // A kernel object name takes one backslash, after "Local".
+    CHECK(a.instance_mutex.find(L'\\', 6) == std::wstring::npos);
+}
+
 TEST_CASE("a profile folder moves everything under it", "[identity]")
 {
     const mdboss::AppIdentity identity =
